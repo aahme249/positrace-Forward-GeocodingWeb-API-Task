@@ -167,7 +167,113 @@ I worked through the brief in the order the requirements were given, since each 
 
 **Thinking:** Nominatim's 1 req/s limit is global to the service, not per-request, so the throttle has to sit above any per-call logic and serialise *everything* going out, including both the address and postal-code queries.
 
-**Implementation:** [`NominatimClient`](GeocodingApi/Services/NominatimClient.cs) is registered as a singleton owning a `SemaphoreSlim(1, 1)` and a `_lastCallAt` timestamp. Every outbound call acquires the semaphore, computes the delay needed to keep ≥1s since the previous call, awaits it if positive, then fires the request and releases. Because it's a singleton semaphore, this holds regardless of how many concurrent batch requests or dedup-losing callers are queued up behind it — they all funnel through the same gate.
+**Implementation:** [`NominatimClient`](GeocodingApi/Services/NominatimClient.cs) is a singleton registered once for the process lifetime. It owns a `TokenBucketRateLimiter` (from `System.Threading.RateLimiting`, built into .NET 7+) configured for 1 token/sec with FIFO queuing. Every outbound call calls `AcquireAsync(1)` — which blocks until a token is available — then fires the HTTP call. Because replenishment is timer-driven (not lease-release-driven), the HTTP call runs concurrently with other in-flight calls: one new call fires every ≥1 s, but N cold addresses complete in ~N seconds, not N × HTTP_time.
+
+---
+
+## Rate-limiting strategy analysis
+
+This is the core design decision in the service — here is why each option was evaluated and which one was chosen.
+
+### The five strategies
+
+**Option 1 — Naive `Task.Delay(1000)`**
+
+The simplest thing that looks correct: before every call, sleep 1 second.
+
+| | |
+|---|---|
+| Advantage | Two lines of code. No dependencies. |
+| Disadvantage | **Broken under any concurrency.** Two simultaneous callers both skip the delay, both fire at the same moment, and Nominatim sees a burst. The delay runs *in parallel with the request*, not before it. |
+| Verdict | **Do not use.** Violates the rate limit as soon as more than one caller is in play. |
+
+---
+
+**Option 2 — `SemaphoreSlim(1,1)` + manual timestamp gate**
+
+The pattern this codebase originally used: one goroutine-like slot guards a `_lastCallAt` field. The semaphore serialises the scheduling decision, computes how long to sleep, then releases *before* the HTTP call so calls can overlap in-flight.
+
+```csharp
+await _throttle.WaitAsync(ct);
+try {
+    var wait = TimeSpan.FromSeconds(1) - (DateTime.UtcNow - _lastCallAt);
+    if (wait > TimeSpan.Zero) await Task.Delay(wait, ct);
+    _lastCallAt = DateTime.UtcNow;
+} finally { _throttle.Release(); } // released BEFORE the HTTP call
+```
+
+| | |
+|---|---|
+| Advantage | Correct. Works without extra packages. The two-phase split (scheduling vs. in-flight) is the right mental model. |
+| Disadvantage | **Requires discipline to get right.** A naive implementation holds the semaphore *through* the HTTP call, serialising everything and making N calls take N × HTTP_time. The fix (release before the call) is non-obvious and easy to miss in code review. Also requires manual `DateTime` arithmetic that `TokenBucketRateLimiter` handles internally. |
+| Verdict | **Correct but dated.** Fine to ship; replaced here for clarity. |
+
+---
+
+**Option 3 — `TokenBucketRateLimiter` (System.Threading.RateLimiting) ✅ CHOSEN**
+
+The idiomatic .NET 7+ approach. A bucket starts with 1 token; a background timer replenishes 1 token/sec (`AutoReplenishment = true`). Every call does `AcquireAsync(1)`, which queues the caller until a token is available — no manual timestamp arithmetic, no two-phase semaphore dance.
+
+```csharp
+private readonly RateLimiter _rateLimiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+{
+    TokenLimit = 1, TokensPerPeriod = 1,
+    ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+    AutoReplenishment = true,
+    QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+    QueueLimit = 10_000,
+});
+
+using var lease = await _rateLimiter.AcquireAsync(permitCount: 1, ct);
+```
+
+Because replenishment is timer-driven (not triggered by lease disposal), holding the lease through the HTTP call does not delay the next token. The HTTP calls genuinely overlap in-flight — the same N-second wall time as option 2, with less code.
+
+| | |
+|---|---|
+| Advantage | **Smooth 1/sec cadence** — no edge-of-window burst (unlike `FixedWindowRateLimiter`). Built into the runtime — no NuGet package. FIFO queue guarantees fair ordering. `CancellationToken` propagation is first-class. |
+| Disadvantage | **In-process only.** Like `SemaphoreSlim`, this lives in one process — two service instances would double the Nominatim request rate. Needs a distributed rate limiter (Redis, etc.) for horizontal scale. |
+| Verdict | **Best choice for this scope.** Single-process, smooth, idiomatic, minimal code. |
+
+**Why `TokenBucket` over `FixedWindow`?**
+
+`FixedWindowRateLimiter(1 req / 1s window)` permits two calls in immediate succession if one arrives at t=0.99 s and the next at t=1.00 s (end of one window → start of the next). Nominatim would see a 10ms gap, not a 1s gap. `TokenBucket` smooths this: a token is consumed and the *next* token is only available 1 s after the *previous* one was consumed, regardless of window boundaries.
+
+---
+
+**Option 4 — Polly `RateLimiter` policy**
+
+Polly's `AddRateLimiter` wraps any `System.Threading.RateLimiting` limiter in a Polly pipeline, so it composes with retry and circuit breaker policies.
+
+| | |
+|---|---|
+| Advantage | Natural fit if you are already using Polly for retry + timeout (as this service does via `Microsoft.Extensions.Http.Resilience`). One pipeline handles rate limiting, retry, and timeout together. |
+| Disadvantage | Rate limiting and retry are fundamentally different concerns: retry reacts to *failure*, rate limiting controls *throughput*. Conflating them in one pipeline makes each harder to reason about. A request that hits a rate-limit delay should not trigger retry logic. |
+| Verdict | **Good in the right context.** Polly's resilience pipeline in this service handles retry + timeout; the rate limiter sits upstream of it in `NominatimClient`, keeping the two concerns cleanly separated. |
+
+---
+
+**Option 5 — `Channel<T>`-based single-consumer queue**
+
+A `Channel<WorkItem>` decouples callers from Nominatim entirely. A single background worker drains the channel at 1 item/sec and writes results to a `TaskCompletionSource` that the original caller awaits.
+
+| | |
+|---|---|
+| Advantage | **The right architecture for high volume.** Enables priority queuing (premium tenants jump the queue), per-client fairness via multiple channels with round-robin dispatch, back-pressure, and graceful shedding under overload. Survives process restarts if the channel is backed by a durable broker (Redis Streams, Azure Service Bus). |
+| Disadvantage | **Significant complexity for this scope.** You trade a 60-line singleton for a background service, work items, TCS lifecycle management, and a new failure mode (the consumer crashes silently). Requires careful handling of cancellation tokens, channel completion, and error propagation back to callers. |
+| Verdict | **Over-engineered for now, right answer at scale.** Add it when batches regularly exceed 50 addresses or the fleet generates sustained bursts of new-route requests. |
+
+---
+
+### Decision summary
+
+```
+Rate-limiting concern:  TokenBucketRateLimiter (Option 3) — smooth 1/sec, no extra packages
+Retry/timeout concern:  Polly via Microsoft.Extensions.Http.Resilience  — separate pipeline
+Scale trigger:          Channel-based queue (Option 5) — when volume demands it
+```
+
+The two concerns (rate limiting and failure recovery) are kept in separate layers. `TokenBucketRateLimiter` fires at most 1 request/sec; Polly retries if that request fails. They compose without interfering.
 
 ---
 
@@ -237,7 +343,7 @@ Sending the same address 5 times in one batch results in a single Nominatim call
 
 - **Cache collapses repeated-route cost to near-zero.** The dominant use case (vehicles re-travelling routes) is served from SQLite with no outbound calls.
 - **In-flight dedup prevents thundering herd.** If 50 vehicles submit the same new address simultaneously, Nominatim is called once, not 50 times.
-- **Rate limiter is tight and correct.** The semaphore is released before the HTTP call, so calls overlap in-flight — one new call fires per second, but N calls complete in N seconds, not N × HTTP_time seconds.
+- **Rate limiter is tight and correct.** `TokenBucketRateLimiter` enforces genuine 1/sec spacing — no edge-of-window burst. Replenishment is timer-driven, so calls overlap in-flight: one new call fires per second, N calls complete in N seconds, not N × HTTP_time seconds.
 - **Per-address error isolation.** One failed address returns `strategy: "error"` without failing the rest of the batch.
 - **Retry with configurable back-off.** Transient Nominatim failures are retried silently before surfacing an error to the caller.
 

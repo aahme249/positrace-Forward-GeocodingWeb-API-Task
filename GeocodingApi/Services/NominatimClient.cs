@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 
 namespace GeocodingApi.Services;
 
@@ -20,13 +21,24 @@ public sealed class NominatimClient : INominatimClient, IDisposable
     private readonly HttpClient _http;
     private readonly ILogger<NominatimClient> _logger;
 
-    // Serialises all outbound calls and enforces ≥1 s between each
-    private readonly SemaphoreSlim _throttle = new(1, 1);
-    private DateTime _lastCallAt = DateTime.MinValue;
+    // TokenBucketRateLimiter: 1 token/sec, FIFO queue, timer-driven replenishment.
+    // Smoother than FixedWindowRateLimiter (no edge-of-window burst) and simpler
+    // than SemaphoreSlim + manual timestamp arithmetic. Because replenishment is
+    // timer-driven (not lease-release-driven), holding the lease through the HTTP
+    // call does not delay the next token — concurrent in-flight calls are fine.
+    private readonly RateLimiter _rateLimiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+    {
+        TokenLimit           = 1,
+        TokensPerPeriod      = 1,
+        ReplenishmentPeriod  = TimeSpan.FromSeconds(1),
+        AutoReplenishment    = true,
+        QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+        QueueLimit           = 10_000,
+    });
 
     public NominatimClient(IHttpClientFactory httpFactory, ILogger<NominatimClient> logger)
     {
-        _http = httpFactory.CreateClient("nominatim");
+        _http   = httpFactory.CreateClient("nominatim");
         _logger = logger;
     }
 
@@ -44,31 +56,16 @@ public sealed class NominatimClient : INominatimClient, IDisposable
 
     private async Task<NominatimResult[]?> ThrottledGetAsync(string url, CancellationToken ct)
     {
-        // Phase 1: serialise only the SCHEDULING decision (when to fire).
-        // Release the semaphore before the HTTP call so concurrent requests can
-        // be in-flight simultaneously — one new request is fired every ≥1 s,
-        // but N requests finish in ~N seconds rather than N × HTTP_time seconds.
-        await _throttle.WaitAsync(ct);
-        try
-        {
-            var wait = TimeSpan.FromSeconds(1) - (DateTime.UtcNow - _lastCallAt);
-            if (wait > TimeSpan.Zero)
-            {
-                _logger.LogDebug("Nominatim rate-limit delay: {Ms}ms", (int)wait.TotalMilliseconds);
-                await Task.Delay(wait, ct);
-            }
+        // Wait until the bucket has a token (≥1 s since the last was consumed).
+        // AcquireAsync queues the caller if empty; the background timer refills
+        // 1 token/sec independent of lease state, so N callers fire at ≥1 s intervals
+        // and their HTTP calls run concurrently in-flight.
+        using var lease = await _rateLimiter.AcquireAsync(permitCount: 1, ct);
+        if (!lease.IsAcquired)
+            throw new InvalidOperationException("Nominatim rate limiter rejected the request.");
 
-            _lastCallAt = DateTime.UtcNow;
-            _logger.LogDebug("Nominatim → {Url}", url);
-        }
-        finally
-        {
-            // Released here — before the HTTP call — so the next request can
-            // schedule itself while this one is still in-flight.
-            _throttle.Release();
-        }
+        _logger.LogDebug("Nominatim → {Url}", url);
 
-        // Phase 2: HTTP call runs concurrently with other in-flight requests.
         try
         {
             var response = await _http.GetAsync(url, ct);
@@ -82,5 +79,5 @@ public sealed class NominatimClient : INominatimClient, IDisposable
         }
     }
 
-    public void Dispose() => _throttle.Dispose();
+    public void Dispose() => _rateLimiter.Dispose();
 }
