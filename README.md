@@ -4,30 +4,68 @@ ASP.NET Core 9 Web API that forward-geocodes Canadian street addresses via the [
 
 ---
 
-## Running locally
+## Quick start
 
-### Docker (recommended)
+### Option A — Docker (no SDK needed)
 
 ```bash
+git clone https://github.com/aahme249/positrace-Forward-GeocodingWeb-API-Task.git
+cd positrace-Forward-GeocodingWeb-API-Task
 docker compose up --build
 ```
 
-API available at **http://localhost:8080** — Swagger UI at **http://localhost:8080/swagger**.
-
-The SQLite database is persisted in a named Docker volume (`geocoding-data`) so the cache survives container restarts.
-
-### .NET SDK
-
-**Prerequisites:** .NET 9 SDK
+### Option B — .NET 9 SDK
 
 ```bash
-cd GeocodingApi
+git clone https://github.com/aahme249/positrace-Forward-GeocodingWeb-API-Task.git
+cd positrace-Forward-GeocodingWeb-API-Task/GeocodingApi
 dotnet run
 ```
 
-Swagger UI is available at **http://localhost:5050/swagger**.
+| | Docker | .NET SDK |
+|---|---|---|
+| API | http://localhost:8080/api/v1/geocode | http://localhost:5050/api/v1/geocode |
+| Swagger UI | http://localhost:8080/swagger | http://localhost:5050/swagger |
 
-The SQLite database file (`geocoding.db`) is created automatically on first startup in the working directory.
+The SQLite cache (`geocoding.db`) is created automatically on first run. No database setup needed.
+
+---
+
+## Try it immediately
+
+**Open Swagger UI** at the URL above — the request and response fields are pre-filled with a mixed example covering all four strategies. Click **Try it out → Execute**.
+
+Or paste this into a terminal:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/geocode \
+  -H "Content-Type: application/json" \
+  -d '{
+    "addresses": [
+      "Apt. 4 456 Yonge St, Toronto, ON M4Y 1X9",
+      "123-12 Main St, Toronto, ON M5V 2T6",
+      "Unit 201 789 Queen St W, Toronto, ON M6J 1G1",
+      "Suite 300 1000 De La Gauchetière W, Montreal, QC H3B 4W5",
+      "#5 100 Wellington St, Ottawa, ON K1A 0A9",
+      "99999 Nowhere Blvd, Apt 12, Toronto, ON M5V 3A8",
+      "Room 412 Fairmont Royal York, 100 Front St W, Toronto, ON M5J 1E3"
+    ]
+  }'
+```
+
+Or use the ready-made sample files:
+
+```bash
+# Each file targets one normalisation rule
+curl -X POST http://localhost:8080/api/v1/geocode \
+  -H "Content-Type: application/json" \
+  -d @samples/mixed-batch.json
+
+# Other samples: apt.json  unit.json  suite.json  hash.json
+#                dash-unit.json  postal-code-fallback.json  not-found.json
+```
+
+If you use VS Code or a JetBrains IDE, open [`requests.http`](requests.http) and click **Send Request** above any block — no curl needed.
 
 ---
 
