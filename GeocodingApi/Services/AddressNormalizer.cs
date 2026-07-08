@@ -26,6 +26,10 @@ public partial class AddressNormalizer : IAddressNormalizer
     [GeneratedRegex(@"\bSuite\s+[\w#-]+,?", RegexOptions.IgnoreCase)]
     private static partial Regex SuiteRegex();
 
+    // "Room" followed by unit identifier (e.g. hotel/casino room numbers)
+    [GeneratedRegex(@"\bRoom\s+[\w#-]+,?", RegexOptions.IgnoreCase)]
+    private static partial Regex RoomRegex();
+
     // "#" followed by identifier (e.g. "#3", "# 3A")
     [GeneratedRegex(@"#\s*[\w-]+,?")]
     private static partial Regex HashUnitRegex();
@@ -61,6 +65,7 @@ public partial class AddressNormalizer : IAddressNormalizer
         result = AptRegex().Replace(result, " ");
         result = UnitRegex().Replace(result, " ");
         result = SuiteRegex().Replace(result, " ");
+        result = RoomRegex().Replace(result, " ");
         result = HashUnitRegex().Replace(result, " ");
 
         // 3. Tidy up whitespace and orphaned commas/punctuation

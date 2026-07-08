@@ -5,7 +5,7 @@ using Microsoft.AspNetCore.Mvc;
 namespace GeocodingApi.Controllers;
 
 [ApiController]
-[Route("api/geocode")]
+[Route("api/v1/geocode")]
 [Produces("application/json")]
 public class GeocodingController(IGeocodingService geocodingService) : ControllerBase
 {

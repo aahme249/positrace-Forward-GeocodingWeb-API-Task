@@ -1,0 +1,14 @@
+services:
+  geocoding-api:
+    build:
+      context: GeocodingApi
+    ports:
+      - "8080:8080"
+    volumes:
+      - geocoding-data:/app/data
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Production
+      - Nominatim__UserAgent=Positrace-Geocoding-Service/1.0 (asifahmed3959@gmail.com)
+
+volumes:
+  geocoding-data:
