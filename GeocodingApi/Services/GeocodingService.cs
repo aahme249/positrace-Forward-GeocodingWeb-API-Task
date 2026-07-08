@@ -35,7 +35,8 @@ public sealed class GeocodingService : IGeocodingService
     public async Task<GeocodeResult> GeocodeAsync(string rawAddress, CancellationToken ct = default)
     {
         var normalized = _normalizer.Normalize(rawAddress);
-        _logger.LogInformation("Geocoding '{Raw}' → normalized: '{Normalized}'", rawAddress, normalized);
+        _logger.LogInformation("[Thread {ThreadId}] Geocoding '{Raw}' → '{Normalized}'",
+            Environment.CurrentManagedThreadId, rawAddress, normalized);
 
         try
         {
@@ -71,7 +72,8 @@ public sealed class GeocodingService : IGeocodingService
         var hit = await ReadFromCacheAsync(normalizedAddress, ct);
         if (hit is not null)
         {
-            _logger.LogDebug("Cache hit for '{Address}'", normalizedAddress);
+            _logger.LogDebug("[Thread {ThreadId}] Cache hit for '{Address}'",
+                Environment.CurrentManagedThreadId, normalizedAddress);
             return hit;
         }
 
@@ -81,7 +83,8 @@ public sealed class GeocodingService : IGeocodingService
         {
             if (_inFlight.TryGetValue(normalizedAddress, out var existing))
             {
-                _logger.LogDebug("Awaiting in-flight request for '{Address}'", normalizedAddress);
+                _logger.LogDebug("[Thread {ThreadId}] Joining in-flight request for '{Address}'",
+                    Environment.CurrentManagedThreadId, normalizedAddress);
                 return await existing.WaitAsync(ct);
             }
 
@@ -127,7 +130,8 @@ public sealed class GeocodingService : IGeocodingService
             var postalCode = _normalizer.ExtractPostalCode(normalizedAddress);
             if (postalCode is not null)
             {
-                _logger.LogInformation("Address not found, falling back to postal code {PostalCode}", postalCode);
+                _logger.LogInformation("[Thread {ThreadId}] Address not found — falling back to postal code '{PostalCode}'",
+                    Environment.CurrentManagedThreadId, postalCode);
                 results = await _nominatim.SearchByPostalCodeAsync(postalCode, ct);
                 strategy = "postal_code";
             }
@@ -135,7 +139,8 @@ public sealed class GeocodingService : IGeocodingService
 
         if (results is null || results.Length == 0)
         {
-            _logger.LogInformation("No results for '{Address}'", normalizedAddress);
+            _logger.LogInformation("[Thread {ThreadId}] No results for '{Address}'",
+                Environment.CurrentManagedThreadId, normalizedAddress);
             return null;
         }
 
@@ -150,6 +155,8 @@ public sealed class GeocodingService : IGeocodingService
             CachedAt = DateTime.UtcNow,
         };
 
+        _logger.LogInformation("[Thread {ThreadId}] Found '{Address}' via {Strategy} → lat={Lat}, lon={Lon}",
+            Environment.CurrentManagedThreadId, normalizedAddress, strategy, entry.Latitude, entry.Longitude);
         await PersistAsync(entry, ct);
         return entry;
     }

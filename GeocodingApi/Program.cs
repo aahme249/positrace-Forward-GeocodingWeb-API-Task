@@ -1,6 +1,7 @@
 using GeocodingApi.Data;
 using GeocodingApi.Models;
 using GeocodingApi.Services;
+using Microsoft.AspNetCore.HttpLogging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Http.Resilience;
 using Polly;
@@ -9,6 +10,15 @@ var builder = WebApplication.CreateBuilder(args);
 
 // ── Controllers + JSON ────────────────────────────────────────────────────────
 builder.Services.AddControllers();
+
+// ── HTTP request/response logging ─────────────────────────────────────────────
+builder.Services.AddHttpLogging(o =>
+{
+    o.LoggingFields = HttpLoggingFields.RequestMethod
+                    | HttpLoggingFields.RequestPath
+                    | HttpLoggingFields.ResponseStatusCode
+                    | HttpLoggingFields.Duration;
+});
 
 // ── Swagger / OpenAPI ─────────────────────────────────────────────────────────
 builder.Services.AddEndpointsApiExplorer();
@@ -65,7 +75,7 @@ builder.Services.AddDbContextFactory<GeocodingDbContext>(options =>
 
 // ── Application services ──────────────────────────────────────────────────────
 builder.Services.AddSingleton<IAddressNormalizer, AddressNormalizer>();
-// NominatimClient is singleton: it owns the rate-limiter SemaphoreSlim that serialises all outbound calls
+// NominatimClient is singleton: it owns the TokenBucketRateLimiter that enforces 1 req/sec to Nominatim
 builder.Services.AddSingleton<INominatimClient, NominatimClient>();
 // GeocodingService is singleton: it owns the in-flight ConcurrentDictionary used for deduplication
 builder.Services.AddSingleton<IGeocodingService, GeocodingService>();
@@ -81,6 +91,7 @@ using (var scope = app.Services.CreateScope())
     await ctx.Database.EnsureCreatedAsync();
 }
 
+app.UseHttpLogging();
 app.UseSwagger();
 app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "Positrace Geocoding API v1"));
 

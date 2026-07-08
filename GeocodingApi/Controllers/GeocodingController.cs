@@ -10,27 +10,27 @@ namespace GeocodingApi.Controllers;
 public class GeocodingController(IGeocodingService geocodingService) : ControllerBase
 {
     /// <summary>
-    /// Geocodes a list of Canadian street addresses.
+    /// Forward-geocode a batch of Canadian street addresses.
     /// </summary>
     /// <remarks>
-    /// <b>Normalisation:</b> unit/apartment qualifiers (Apt, Unit, Suite, Room, #, dash-prefix) are
-    /// stripped before querying Nominatim so the geocoder sees the cleanest possible input.
+    /// **How it works**
     ///
-    /// <b>Fallback:</b> if the normalised address returns no result, the service retries using only
-    /// the postal code extracted from the input. The <c>strategy</c> field tells you which path
-    /// produced the result: <c>address</c>, <c>postal_code</c>, <c>not_found</c>, or <c>error</c>.
+    /// 1. Each address is **normalised** — unit/apt qualifiers (Apt, Unit, Suite, Room, #, dash-prefix) are stripped before querying Nominatim.
+    /// 2. If the normalised address returns no result, the service **falls back to the postal code** embedded in the input.
+    /// 3. Results are returned in the **same order** as the input. Every result echoes `originalAddress` so it maps unambiguously back to its source.
+    /// 4. The `strategy` field tells you which path produced each result: `address`, `postal_code`, `not_found`, or `error`.
     ///
-    /// <b>Throughput:</b> Nominatim enforces 1 request/second. One new outbound call is fired every
-    /// ≥1 s; calls run concurrently in-flight, so a batch of N cold-cache addresses completes in
-    /// roughly N seconds (not N × HTTP_time). Cached addresses return immediately.
+    /// **Performance**
     ///
-    /// <b>Timeout &amp; retry:</b> each Nominatim call times out after <c>Nominatim:TimeoutSeconds</c>
-    /// (default 5 s) and is retried up to <c>Nominatim:RetryCount</c> times (default 3) with a
-    /// fixed delay of <c>Nominatim:RetryDelaySeconds</c> (default 2 s) between attempts.
+    /// - Nominatim enforces **1 request/second**. Cold-cache batches complete in roughly N seconds for N unique addresses.
+    /// - **Cached addresses return immediately** (SQLite lookup, no outbound call).
+    /// - **Duplicate addresses** in the same batch or from concurrent clients result in a single Nominatim call shared by all waiters.
     ///
-    /// <b>Batch sizing:</b> there is no hard limit on the number of addresses, but as a guideline:
-    /// keep batches under 50 for sub-minute response times. For larger workloads consider splitting
-    /// into multiple requests.
+    /// **Timeout &amp; retry**
+    ///
+    /// Each Nominatim call times out after `Nominatim:TimeoutSeconds` (default 5 s) and is retried up to `Nominatim:RetryCount` times (default 3) with `Nominatim:RetryDelaySeconds` (default 2 s) between attempts. All values are configurable in `appsettings.json`.
+    ///
+    /// **Recommended batch size:** under 50 addresses for sub-minute response times.
     /// </remarks>
     [HttpPost]
     [ProducesResponseType(typeof(GeocodeResponse), StatusCodes.Status200OK)]

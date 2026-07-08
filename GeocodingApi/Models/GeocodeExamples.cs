@@ -13,16 +13,19 @@ public class GeocodeExampleFilter : IOperationFilter
         // ── Request example ───────────────────────────────────────────────────
         if (operation.RequestBody?.Content.TryGetValue("application/json", out var reqMedia) == true)
         {
-            reqMedia.Example = new OpenApiArray
+            reqMedia.Example = new OpenApiObject
             {
-                new OpenApiString("Apt. 4 456 Yonge St, Toronto, ON M4Y 1X9"),
-                new OpenApiString("123-12 Main St, Toronto, ON M5V 2T6"),
-                new OpenApiString("Unit 201 789 Queen St W, Toronto, ON M6J 1G1"),
-                new OpenApiString("Suite 300 1000 De La Gauchetière W, Montreal, QC H3B 4W5"),
-                new OpenApiString("#5 100 Wellington St, Ottawa, ON K1A 0A9"),
-                new OpenApiString("99999 Nowhere Blvd, Apt 12, Toronto, ON M5V 3A8"),
-                new OpenApiString("Room 412 Fairmont Royal York, 100 Front St W, Toronto, ON M5J 1E3"),
-                new OpenApiString("Unit 5 99999 Nowhere Blvd, Faketown, ON"),
+                ["addresses"] = new OpenApiArray
+                {
+                    new OpenApiString("Apt. 4 456 Yonge St, Toronto, ON M4Y 1X9"),
+                    new OpenApiString("123-12 Main St, Toronto, ON M5V 2T6"),
+                    new OpenApiString("Unit 201 789 Queen St W, Toronto, ON M6J 1G1"),
+                    new OpenApiString("Suite 300 1000 De La Gauchetière W, Montreal, QC H3B 4W5"),
+                    new OpenApiString("#5 100 Wellington St, Ottawa, ON K1A 0A9"),
+                    new OpenApiString("99999 Nowhere Blvd, Apt 12, Toronto, ON M5V 3A8"),
+                    new OpenApiString("Room 412 Fairmont Royal York, 100 Front St W, Toronto, ON M5J 1E3"),
+                    new OpenApiString("Unit 5 99999 Nowhere Blvd, Faketown, ON"),
+                }
             };
         }
 
