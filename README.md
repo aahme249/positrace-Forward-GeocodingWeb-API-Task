@@ -1,25 +1,37 @@
 # Positrace Geocoding API
 
-ASP.NET Core 8 Web API that forward-geocodes Canadian street addresses via the [Nominatim](https://nominatim.org/) public API.
+ASP.NET Core 9 Web API that forward-geocodes Canadian street addresses via the [Nominatim](https://nominatim.org/) public API. Built for the Positrace Senior Backend Engineer technical assessment.
 
 ---
 
 ## Running locally
 
-**Prerequisites:** .NET 8 SDK
+### Docker (recommended)
+
+```bash
+docker compose up --build
+```
+
+API available at **http://localhost:8080** — Swagger UI at **http://localhost:8080/swagger**.
+
+The SQLite database is persisted in a named Docker volume (`geocoding-data`) so the cache survives container restarts.
+
+### .NET SDK
+
+**Prerequisites:** .NET 9 SDK
 
 ```bash
 cd GeocodingApi
 dotnet run
 ```
 
-Swagger UI is available at **http://localhost:5000/swagger** (or the port shown in the console).
+Swagger UI is available at **http://localhost:5050/swagger**.
 
 The SQLite database file (`geocoding.db`) is created automatically on first startup in the working directory.
 
 ---
 
-## POST /api/geocode
+## POST /api/v1/geocode
 
 **Request**
 
@@ -54,6 +66,8 @@ The SQLite database file (`geocoding.db`) is created automatically on first star
 }
 ```
 
+Results are returned in the same order and count as the input list, and each one echoes `originalAddress`, so every result maps unambiguously back to its source — including duplicate address strings within the same batch.
+
 ### `strategy` values
 
 | Value | Meaning |
@@ -63,69 +77,84 @@ The SQLite database file (`geocoding.db`) is created automatically on first star
 | `not_found` | Neither query returned results |
 | `error` | Nominatim was unreachable or returned an HTTP error |
 
+Ready-to-run requests for every case below are in [`requests.http`](requests.http) and [`samples/`](samples).
+
 ---
 
-## Address normalisation
+## My approach, step by step
 
-The service strips the following qualifiers before querying Nominatim, giving the geocoder the cleanest possible input:
+I worked through the brief in the order the requirements were given, since each one builds on the last: normalize → geocode → fall back → cache → dedupe → throttle.
 
-| Pattern | Example in → out |
+### 1. Address normalization
+
+**Thinking:** Nominatim matches street addresses more reliably without unit/apartment qualifiers, so I strip them *before* the address reaches the outbound client — and I keep the normalised string alongside the raw one in every result, so it's always visible what was actually queried.
+
+**Implementation:** [`AddressNormalizer`](GeocodingApi/Services/AddressNormalizer.cs) runs a fixed pipeline of compiled regexes:
+
+1. Strip a dash-prefixed unit at the very start of the string (`123-12 Main St` → `123 Main St`) — done first, before any other pass can shift the leading digits.
+2. Strip `Apt`/`Apt.`, `Unit`, `Suite`, and `#`, each followed by its identifier token, wherever they appear.
+3. Collapse the doubled commas/whitespace those removals leave behind.
+
+**Known limitations** (calling these out explicitly rather than leaving them to be discovered):
+
+- The unit identifier is matched as a single whitespace-delimited token, so `Unit 12A` strips cleanly but `Unit 12 A` (a space inside the identifier) would not be fully removed.
+- The dash-prefix rule only fires when the pattern sits at the very start of the trimmed address — `Main St 123-12` would not match.
+- French-language equivalents (`App.`, `No`, `Bureau`) aren't handled — every example in the brief was English, so I scoped to what was asked rather than guessing at unstated requirements.
+
+### 2. Fallback strategy
+
+**Thinking:** A normalised address can still fail to geocode (typo'd street name, address not present in OSM, etc.), but the postal code embedded in the same string is usually still valid and resolves to *something* useful. So the fallback is the same address via a different query, not a different address.
+
+**Implementation:** [`GeocodingService.FetchAndCacheAsync`](GeocodingApi/Services/GeocodingService.cs) tries the normalised street address first; only if Nominatim returns zero results does it call `ExtractPostalCode` (a Canadian postal-code regex, `A1A 1A1`) and retry against `/search?postalcode=`. The `strategy` field tells the caller which query actually produced the coordinates, so a postal-code-level result (block precision) is never silently confused with an exact street match.
+
+### 3. In-flight deduplication
+
+**Thinking:** A batch request can legitimately contain the same address twice, and separate concurrent HTTP requests can target the same address. Neither case should cost two outbound Nominatim calls when one suffices.
+
+**Implementation:** `GeocodingService` holds a `ConcurrentDictionary<string, Task<CachedGeocode?>>` keyed on the *normalised* address. The first caller for a given key wins a `TryAdd` and does the real fetch; every other caller for that key gets the same `Task` back and awaits it instead of starting its own. I used a `TaskCompletionSource` (with `RunContinuationsAsynchronously`) rather than caching the fetch method's `Task` directly, so a slow continuation on one waiter can't block the others. The entry is removed in a `finally` once the fetch settles — success or failure — so the next request for that address goes through the persistent cache or triggers a genuinely fresh fetch, rather than replaying a stale in-flight task.
+
+### 4. Persistent cache
+
+**Thinking:** Vehicles retravel the same routes, so the same addresses recur across restarts — the whole point of persisting is to avoid re-paying the 1 req/s Nominatim cost for something already known. I used SQLite via EF Core: a single-file, dependency-free store is enough for a cache table and keeps `docker compose up` a one-liner.
+
+**Cache key decision — normalised address, not raw input.** I considered keying on the raw string first (no transformation needed at lookup time) but rejected it:
+
+1. **It collapses duplicates.** `"123 Main St Apt 4"`, `"123 Main St Unit 4"`, and `"123-4 Main St"` all normalise to `"123 Main St"`. A raw-input key treats all three as separate cache misses, each firing its own Nominatim call; a normalised key lets them share one entry.
+2. **It matches the source of truth.** What's cached is Nominatim's answer to the query actually sent. Keying on raw input would mean re-normalising on every lookup just to decide whether a stored result applies — redundant.
+3. **Trade-off I accepted:** if normalisation is wrong for some input, the bad cached result would be shared by every raw address mapping to that same wrong key. I judged this acceptable — the failure mode is the normaliser being wrong, which is a bug regardless of caching, and fixing it fixes the cache automatically.
+
+**Implementation:** [`CachedGeocode`](GeocodingApi/Data/CachedGeocode.cs) rows are looked up by `NormalizedAddress` before any outbound call is even considered (`ReadFromCacheAsync`), so a warm cache never touches the in-flight map or Nominatim at all. Writes go through `PersistAsync`, which swallows `DbUpdateException` — a benign race if two processes happen to persist the same key concurrently — rather than failing the request over a duplicate write.
+
+### 5. Rate limiting
+
+**Thinking:** Nominatim's 1 req/s limit is global to the service, not per-request, so the throttle has to sit above any per-call logic and serialise *everything* going out, including both the address and postal-code queries.
+
+**Implementation:** [`NominatimClient`](GeocodingApi/Services/NominatimClient.cs) is registered as a singleton owning a `SemaphoreSlim(1, 1)` and a `_lastCallAt` timestamp. Every outbound call acquires the semaphore, computes the delay needed to keep ≥1s since the previous call, awaits it if positive, then fires the request and releases. Because it's a singleton semaphore, this holds regardless of how many concurrent batch requests or dedup-losing callers are queued up behind it — they all funnel through the same gate.
+
+---
+
+## Transient failures & operational visibility
+
+- **Transient failures:** `NominatimClient.EnsureSuccessStatusCode()` throws on non-2xx responses; `GeocodingService.GeocodeAsync` catches per-address, not per-batch, so one bad address returns `strategy: "error"` with the exception message instead of failing the whole request. Because the failure happens inside the in-flight task, every concurrent waiter on that same address also receives the exception (via `tcs.SetException`) rather than hanging indefinitely.
+- **Logging:** every stage logs through `ILogger<T>` — normalisation result, cache hit/miss, in-flight wait, postal-code fallback trigger, rate-limit delay, outbound URL — at `Information`/`Debug`, so a production deployment can trace which path a given address took without attaching a debugger. Levels are tunable per-namespace in `appsettings.json`.
+- **Configuration:** Nominatim base URL, User-Agent (required by Nominatim's usage policy — set to a real contact address), and the SQLite connection string are all externalised via `appsettings.json` / environment variables (see `docker-compose.yml`), not hardcoded, so they can change without a rebuild.
+
+---
+
+## Test cases
+
+One fixture per normalisation rule, plus the two non-happy paths, so each can be exercised independently or as a batch:
+
+| File | Exercises |
 |---|---|
-| Dash-prefixed unit (at address start) | `123-12 Main St` → `123 Main St` |
-| `Apt` / `Apt.` + identifier | `Apt. 4 456 Yonge St` → `456 Yonge St` |
-| `Unit` + identifier | `Unit 201 789 Queen St` → `789 Queen St` |
-| `Suite` + identifier | `Suite 300 1000 De La Gauchetière` → `1000 De La Gauchetière` |
-| `#` + identifier | `#5 100 Wellington St` → `100 Wellington St` |
+| `samples/dash-unit.json` | Dash-prefixed unit (`123-12 Main St`) |
+| `samples/apt.json` | `Apt` and `Apt.` (with and without period) |
+| `samples/unit.json` | `Unit` qualifier |
+| `samples/suite.json` | `Suite` qualifier |
+| `samples/hash.json` | `#` qualifier |
+| `samples/postal-code-fallback.json` | Nonsense street name, valid postal code → `strategy: "postal_code"` |
+| `samples/not-found.json` | Nonsense street *and* no postal code → `strategy: "not_found"` |
+| `samples/mixed-batch.json` | All of the above in a single request, to confirm ordering/mapping holds under a mixed batch |
 
-**Known limitations**
-
-- The unit identifier is matched as a single whitespace-delimited token (e.g. `Unit 12A` strips `12A`). Multi-token identifiers (`Unit 12 A`) are not handled.
-- The dash-prefix rule (`123-12 Main`) is only applied when the pattern appears at the very start of the address string after trimming.
-- Qualifiers buried mid-sentence (e.g. `123 Main St, Apt 4, Floor 2`) will have the qualifier stripped but surrounding commas may leave a double-comma, which the cleanup pass collapses.
-- French-language equivalents (`App.`, `No`, `Bureau`) are not currently stripped.
-
----
-
-## Cache key decision
-
-**The cache key is the *normalised* address, not the raw input.**
-
-The cache is keyed on the normalised form (the string actually sent to Nominatim) rather than the raw input that arrived from the caller.
-
-**Why this is the right choice:**
-
-1. **Collapses duplicates before they hit the cache.** `"123 Main St Apt 4"`, `"123 Main St Unit 4"`, and `"123-4 Main St"` all normalise to `"123 Main St"`. With a raw-input key each would be a separate cache miss triggering a redundant Nominatim call; with the normalised key all three share one entry.
-
-2. **Matches the source of truth.** What gets cached is Nominatim's response to the query we actually sent. Keying on the raw input would require re-normalising on every cache lookup to decide whether the stored result applies, which is redundant.
-
-3. **Tradeoff acknowledged.** If normalisation is incorrect for a given input (a known limitation), the wrong cached result could be returned for any raw address that maps to the same bad normalised key. This is acceptable: the failure mode (bad normalisation) is the same whether or not caching is involved, and fixing the normaliser fixes the cache automatically.
-
----
-
-## Design notes
-
-### In-flight deduplication
-
-`GeocodingService` holds a `ConcurrentDictionary<string, Task<CachedGeocode?>>` keyed on the normalised address. When a Nominatim call is in progress, new concurrent requests for the same address get the same `Task` and `await` it rather than making their own outbound call. Once the task completes (or faults) the entry is removed.
-
-### Rate limiting
-
-`NominatimClient` owns a `SemaphoreSlim(1,1)` and tracks `_lastCallAt`. Before every outbound request it waits for the semaphore, checks the elapsed time since the last call, and delays if less than one second has passed. This serialises all outbound calls and enforces ≥ 1 s between them regardless of how many concurrent geocoding requests are in flight.
-
-### Transient failure handling
-
-HTTP errors from Nominatim (`EnsureSuccessStatusCode`) propagate as exceptions. `GeocodingService` catches them per-address and returns `strategy: "error"` with the exception message, so one bad address does not fail the entire batch. The `_inFlight` task is faulted, so concurrent waiters on the same address also receive the error rather than silently hanging.
-
-### Configuration
-
-All tunable values live in `appsettings.json`:
-
-```json
-{
-  "ConnectionStrings": { "DefaultConnection": "Data Source=geocoding.db" },
-  "Nominatim": {
-    "BaseUrl": "https://nominatim.openstreetmap.org/",
-    "UserAgent": "Positrace-Geocoding-Service/1.0 (your@email.com)"
-  }
-}
-```
+[`requests.http`](requests.http) wraps the same cases as runnable requests (VS Code REST Client / JetBrains HTTP Client). I didn't add a separate xUnit project for this assessment — given the scope, I prioritised exercising the real HTTP surface end-to-end (actual rate limiter, actual cache, actual Nominatim) over unit-testing the regex pipeline in isolation, since the normalisation rules are small enough to verify directly against [`AddressNormalizer.cs`](GeocodingApi/Services/AddressNormalizer.cs).
+# positrace-Forward-GeocodingWeb-API-Task
