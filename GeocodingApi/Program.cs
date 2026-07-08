@@ -1,6 +1,9 @@
 using GeocodingApi.Data;
+using GeocodingApi.Models;
 using GeocodingApi.Services;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Http.Resilience;
+using Polly;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -20,18 +23,39 @@ builder.Services.AddSwaggerGen(c =>
     var xmlFile = $"{System.Reflection.Assembly.GetExecutingAssembly().GetName().Name}.xml";
     var xmlPath = Path.Combine(AppContext.BaseDirectory, xmlFile);
     if (File.Exists(xmlPath)) c.IncludeXmlComments(xmlPath);
+    c.OperationFilter<GeocodeExampleFilter>();
 });
 
 // ── Nominatim HttpClient ──────────────────────────────────────────────────────
-var nominatimBase = builder.Configuration["Nominatim:BaseUrl"] ?? "https://nominatim.openstreetmap.org/";
-var userAgent     = builder.Configuration["Nominatim:UserAgent"]
-                    ?? "Positrace-Geocoding-Service/1.0 (asifahmed3959@gmail.com)";
+var nominatimBase  = builder.Configuration["Nominatim:BaseUrl"] ?? "https://nominatim.openstreetmap.org/";
+var userAgent      = builder.Configuration["Nominatim:UserAgent"]
+                     ?? "Positrace-Geocoding-Service/1.0 (asifahmed3959@gmail.com)";
+var timeoutSeconds = builder.Configuration.GetValue<int>("Nominatim:TimeoutSeconds", 5);
+var retryCount     = builder.Configuration.GetValue<int>("Nominatim:RetryCount", 3);
+var retryDelay     = builder.Configuration.GetValue<int>("Nominatim:RetryDelaySeconds", 2);
 
 builder.Services.AddHttpClient("nominatim", client =>
 {
     client.BaseAddress = new Uri(nominatimBase);
     client.DefaultRequestHeaders.Add("User-Agent", userAgent);
-    client.Timeout = TimeSpan.FromSeconds(10);
+    client.Timeout = TimeSpan.FromSeconds(timeoutSeconds * (retryCount + 1)); // outer timeout covers all retries
+})
+.AddResilienceHandler("nominatim-retry", pipeline =>
+{
+    pipeline.AddRetry(new HttpRetryStrategyOptions
+    {
+        MaxRetryAttempts = retryCount,
+        Delay             = TimeSpan.FromSeconds(retryDelay),
+        BackoffType       = DelayBackoffType.Constant,
+        // Retry on transient HTTP errors and timeouts only — not on 4xx
+        ShouldHandle      = args => args.Outcome switch
+        {
+            { Exception: HttpRequestException or TaskCanceledException } => PredicateResult.True(),
+            { Result.IsSuccessStatusCode: false }                        => PredicateResult.True(),
+            _                                                            => PredicateResult.False()
+        }
+    });
+    pipeline.AddTimeout(TimeSpan.FromSeconds(timeoutSeconds));
 });
 
 // ── Persistent cache (SQLite + EF Core) ──────────────────────────────────────

@@ -44,6 +44,10 @@ public sealed class NominatimClient : INominatimClient, IDisposable
 
     private async Task<NominatimResult[]?> ThrottledGetAsync(string url, CancellationToken ct)
     {
+        // Phase 1: serialise only the SCHEDULING decision (when to fire).
+        // Release the semaphore before the HTTP call so concurrent requests can
+        // be in-flight simultaneously — one new request is fired every ≥1 s,
+        // but N requests finish in ~N seconds rather than N × HTTP_time seconds.
         await _throttle.WaitAsync(ct);
         try
         {
@@ -54,9 +58,19 @@ public sealed class NominatimClient : INominatimClient, IDisposable
                 await Task.Delay(wait, ct);
             }
 
-            _logger.LogDebug("Nominatim → {Url}", url);
             _lastCallAt = DateTime.UtcNow;
+            _logger.LogDebug("Nominatim → {Url}", url);
+        }
+        finally
+        {
+            // Released here — before the HTTP call — so the next request can
+            // schedule itself while this one is still in-flight.
+            _throttle.Release();
+        }
 
+        // Phase 2: HTTP call runs concurrently with other in-flight requests.
+        try
+        {
             var response = await _http.GetAsync(url, ct);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadFromJsonAsync<NominatimResult[]>(ct);
@@ -65,10 +79,6 @@ public sealed class NominatimClient : INominatimClient, IDisposable
         {
             _logger.LogError(ex, "Nominatim HTTP error for {Url}", url);
             throw;
-        }
-        finally
-        {
-            _throttle.Release();
         }
     }
 

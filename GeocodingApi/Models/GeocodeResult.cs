@@ -1,5 +1,7 @@
 namespace GeocodingApi.Models;
 
+public record GeocodeResponse(IEnumerable<GeocodeResult> Results);
+
 public record GeocodeResult
 {
     public required string OriginalAddress { get; init; }

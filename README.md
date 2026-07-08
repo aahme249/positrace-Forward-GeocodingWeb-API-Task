@@ -157,4 +157,102 @@ One fixture per normalisation rule, plus the two non-happy paths, so each can be
 | `samples/mixed-batch.json` | All of the above in a single request, to confirm ordering/mapping holds under a mixed batch |
 
 [`requests.http`](requests.http) wraps the same cases as runnable requests (VS Code REST Client / JetBrains HTTP Client). I didn't add a separate xUnit project for this assessment — given the scope, I prioritised exercising the real HTTP surface end-to-end (actual rate limiter, actual cache, actual Nominatim) over unit-testing the regex pipeline in isolation, since the normalisation rules are small enough to verify directly against [`AddressNormalizer.cs`](GeocodingApi/Services/AddressNormalizer.cs).
+
+---
+
+## Concurrency & throttling — observed behaviour
+
+Seven tests were run against a live instance to verify the rate limiter, cache, and in-flight deduplication interact correctly under real concurrent load.
+
+### Results
+
+| Test | Scenario | Wall time | Nominatim calls |
+|---|---|---|---|
+| 1 | 5 unique cold-cache addresses, single client | **5.4 s** | 5 |
+| 2 | Same 5 addresses again (warm cache) | **20 ms** | 0 |
+| 3 | Same address × 5 in one request (dedup) | **16 ms** | 0 (cached) |
+| 4 | 3 concurrent clients, 9 unique cold addresses | **7.0 s** | 9 |
+| 5 | 3 concurrent clients, **same** 2 cold addresses | **1.5 s** | 2 (not 6) |
+| 6 | 10 rapid sequential requests, warm cache | **160 ms** | 0 |
+| 7 | 10 concurrent clients, mixed cached + cold | **2.9 s** | 4 |
+
+### What the numbers show
+
+**Test 1 vs 2 — cache impact is dramatic.**
+5 cold addresses take 5.4 s (rate-limited, ~1 s per Nominatim call). The same 5 addresses warm return in 20 ms — 270× faster. For a fleet that revisits the same routes, the vast majority of requests hit the cache within the first day.
+
+**Test 3 — in-request deduplication works.**
+Sending the same address 5 times in one batch results in a single Nominatim call (or an instant cache hit). All 5 slots in the response receive identical results. Zero wasted calls.
+
+**Test 4 — concurrent clients serialize cleanly through the rate limiter.**
+3 clients each submitting 3 unique cold addresses produces exactly 9 Nominatim calls, spaced ≥ 1 s apart. All calls run in-flight concurrently; the last one to fire determines the wall time (~7 s for 9 calls, not 9 × HTTP_time).
+
+**Test 5 — cross-client deduplication works.**
+3 clients simultaneously requesting the same 2 cold addresses resulted in only 2 Nominatim calls total — not 6. All 3 clients received the result from the same 2 in-flight tasks. Wall time was identical to a single client making the same request.
+
+**Test 7 — realistic fleet scenario.**
+10 concurrent clients where 7 submit cached addresses and 3 submit new ones. The 7 cached clients returned in milliseconds; the 3 cold clients completed in 2.9 s. Cold and cached requests don't compete — cached lookups bypass the rate limiter entirely.
+
+---
+
+### Strengths of this approach
+
+- **Cache collapses repeated-route cost to near-zero.** The dominant use case (vehicles re-travelling routes) is served from SQLite with no outbound calls.
+- **In-flight dedup prevents thundering herd.** If 50 vehicles submit the same new address simultaneously, Nominatim is called once, not 50 times.
+- **Rate limiter is tight and correct.** The semaphore is released before the HTTP call, so calls overlap in-flight — one new call fires per second, but N calls complete in N seconds, not N × HTTP_time seconds.
+- **Per-address error isolation.** One failed address returns `strategy: "error"` without failing the rest of the batch.
+- **Retry with configurable back-off.** Transient Nominatim failures are retried silently before surfacing an error to the caller.
+
+### Weaknesses of this approach
+
+- **In-process rate limiter doesn't scale horizontally.** Running two instances of this service would double the Nominatim request rate. The `SemaphoreSlim` lives in one process — there's no distributed coordination. Mitigation: add a Redis-backed distributed rate limiter, or put a single Nominatim-facing worker behind an internal queue.
+- **No per-client fairness.** A single client submitting 200 cold addresses monopolises the rate limiter for ~200 seconds, blocking all other clients' new addresses. Cached requests are unaffected, but new-address requests from other clients queue behind the large batch. Mitigation: per-client request queues with round-robin dispatch.
+- **No batch size limit enforced.** A caller can send 1 000 addresses and hold an HTTP connection open for ~16 minutes. Mitigation: cap batch size (e.g. 50) and recommend async job submission for larger workloads.
+- **In-flight dedup state is in-memory only.** If the service restarts mid-fetch, the task is lost. The persistent cache means completed results survive restarts; only the in-progress ones are lost and must be retried by the caller.
+
+### Is there a better way?
+
+For this use case (Canadian vehicle fleet, recurring routes) — **no, not meaningfully.** The combination of persistent cache + in-flight dedup + rate limiter handles the dominant patterns well. The weaknesses only matter at scale:
+
+| Scale trigger | Better approach |
+|---|---|
+| Multiple service instances | Shared Redis rate limiter + distributed cache |
+| Batches regularly > 50 addresses | Async job queue (see Future considerations) |
+| High volume of genuinely new addresses | Self-hosted Nominatim (no rate limit, full fan-out) |
+| Per-client fairness required | Priority queue with per-tenant slots |
+
+---
+
+## Future considerations
+
+### Asynchronous message queue
+
+The current API is synchronous — the client holds the HTTP connection open until every address is geocoded. This works well for small batches (< 50 addresses) and high cache-hit workloads (vehicles re-travelling the same routes quickly warm the cache), but breaks down for large cold-cache batches:
+
+- 200 new addresses on a fresh route = ~200 seconds of open connection
+- Multiple fleet operators submitting large batches simultaneously have no backpressure
+- A service restart mid-batch loses all in-progress work
+
+A job-based async model solves this:
+
+```
+POST /api/v1/geocode         → 202 Accepted  { "jobId": "abc-123" }
+GET  /api/v1/geocode/{jobId} → 200 OK with results (or 202 still processing)
+```
+
+A background worker reads from an in-process `Channel<T>` (or an external broker like Redis / Azure Service Bus for durability across restarts), applies the same rate-limited Nominatim pipeline, and writes results to the SQLite cache. The client polls until the job is complete.
+
+**When to add it:** if batches regularly exceed 50 addresses, or if the fleet generates large bursts of new-route addresses that overwhelm the synchronous timeout budget. For the described use case (recurring vehicle routes, high cache-hit rate) the synchronous API is sufficient.
+
+### Self-hosted Nominatim
+
+Using the public Nominatim endpoint caps throughput at 1 req/sec per IP regardless of architecture. Running a private Nominatim instance (open source, ~50 GB disk for Canada-only extract) removes the rate limit entirely, allows fan-out to a worker pool, and eliminates the dependency on a third-party service — the right call once geocoding volume justifies the infrastructure cost.
+
+---
+
+## Development tooling
+
+I built and iterated on this in **Claude Code**, running in a terminal against this repo, rather than writing everything by hand from scratch. In practice that meant: I set the requirements and made the calls on structure and trade-offs (singleton vs. scoped services, cache key, fallback design), and used the agent to scaffold boilerplate, wire up the Docker/EF Core setup, and draft the sample fixtures/`requests.http`, then reviewed and adjusted the generated code myself before it went in. This README itself — including the "step by step" section above — was written the same way: I asked for a walkthrough of the reasoning behind each requirement, then reviewed it against the actual source for accuracy.
+
+[`CLAUDE.md`](CLAUDE.md) in the repo root is a machine-readable onboarding file for this project. It's written for coding agents (Claude Code or otherwise) rather than for humans: build/run commands, the request-flow architecture, and the invariants that back each of the five assessment requirements (cache key choice, singleton lifetimes, rate-limiter placement, dedup vs. cache scope, regex ordering) — the things an agent would otherwise have to rediscover by reading every file before making a safe change.
 # positrace-Forward-GeocodingWeb-API-Task

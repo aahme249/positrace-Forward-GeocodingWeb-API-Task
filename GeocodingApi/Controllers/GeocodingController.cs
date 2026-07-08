@@ -13,10 +13,24 @@ public class GeocodingController(IGeocodingService geocodingService) : Controlle
     /// Geocodes a list of Canadian street addresses.
     /// </summary>
     /// <remarks>
-    /// Each address is normalised (apartment/unit qualifiers stripped) before querying Nominatim.
-    /// If the normalised address yields no result, the service falls back to the postal code embedded
-    /// in the input. The <c>strategy</c> field in each result indicates which path was taken:
-    /// <c>address</c>, <c>postal_code</c>, <c>not_found</c>, or <c>error</c>.
+    /// <b>Normalisation:</b> unit/apartment qualifiers (Apt, Unit, Suite, Room, #, dash-prefix) are
+    /// stripped before querying Nominatim so the geocoder sees the cleanest possible input.
+    ///
+    /// <b>Fallback:</b> if the normalised address returns no result, the service retries using only
+    /// the postal code extracted from the input. The <c>strategy</c> field tells you which path
+    /// produced the result: <c>address</c>, <c>postal_code</c>, <c>not_found</c>, or <c>error</c>.
+    ///
+    /// <b>Throughput:</b> Nominatim enforces 1 request/second. One new outbound call is fired every
+    /// ≥1 s; calls run concurrently in-flight, so a batch of N cold-cache addresses completes in
+    /// roughly N seconds (not N × HTTP_time). Cached addresses return immediately.
+    ///
+    /// <b>Timeout &amp; retry:</b> each Nominatim call times out after <c>Nominatim:TimeoutSeconds</c>
+    /// (default 5 s) and is retried up to <c>Nominatim:RetryCount</c> times (default 3) with a
+    /// fixed delay of <c>Nominatim:RetryDelaySeconds</c> (default 2 s) between attempts.
+    ///
+    /// <b>Batch sizing:</b> there is no hard limit on the number of addresses, but as a guideline:
+    /// keep batches under 50 for sub-minute response times. For larger workloads consider splitting
+    /// into multiple requests.
     /// </remarks>
     [HttpPost]
     [ProducesResponseType(typeof(GeocodeResponse), StatusCodes.Status200OK)]
@@ -33,4 +47,3 @@ public class GeocodingController(IGeocodingService geocodingService) : Controlle
     }
 }
 
-public record GeocodeResponse(IEnumerable<GeocodeResult> Results);
