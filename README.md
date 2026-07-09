@@ -119,6 +119,82 @@ Ready-to-run requests for every case below are in [`requests.http`](requests.htt
 
 ---
 
+## Architecture
+
+### Request flow
+
+```mermaid
+flowchart TD
+    A([Client\nPOST /api/v1/geocode\nbatch of N addresses]) --> B
+
+    B[GeocodingController\nTask.WhenAll — all addresses run concurrently]
+
+    B -->|per address| C[AddressNormalizer\nstrip Apt · Unit · Suite · Room · # · dash-prefix]
+
+    C --> D[(SQLite Cache\nlookup by normalizedAddress)]
+
+    D -->|HIT| Z1([✓ Return cached result\n~1 ms · zero Nominatim calls])
+
+    D -->|MISS| E{ConcurrentDictionary\nsame address already in-flight?}
+
+    E -->|YES — await existing Task| Z1
+
+    E -->|NO — TryAdd and own the fetch| G
+
+    G[TokenBucketRateLimiter\n1 token · sec — FIFO queue\nconcurrent HTTP calls allowed]
+
+    G -->|token acquired| H[Polly Resilience Pipeline\nRetry → CircuitBreaker → Timeout]
+
+    H -->|circuit OPEN\n5 failures in 30 s| Z2([✗ strategy: error\nfast-fail for 30 s])
+
+    H -->|HTTP GET| I[(Nominatim\nnominatim.openstreetmap.org)]
+
+    I -->|results found| J[Write to SQLite\nPersistAsync]
+    J --> Z3([✓ strategy: address])
+
+    I -->|no results| K{Canadian postal code\nin the address?}
+    K -->|NO| Z4([✗ strategy: not_found])
+    K -->|YES — retry via postalcode=| G
+
+    Z3 -->|postal code path| Z5([✓ strategy: postal_code])
+
+    style Z1 fill:#16a34a,color:#fff
+    style Z3 fill:#16a34a,color:#fff
+    style Z5 fill:#16a34a,color:#fff
+    style Z2 fill:#dc2626,color:#fff
+    style Z4 fill:#ea580c,color:#fff
+```
+
+### Concurrent deduplication
+
+```mermaid
+sequenceDiagram
+    participant C1 as Client 1
+    participant C2 as Client 2
+    participant C3 as Client 3
+    participant GS as GeocodingService
+    participant CD as ConcurrentDictionary
+    participant N  as Nominatim
+
+    C1->>GS: GeocodeAsync("456 Yonge St")
+    C2->>GS: GeocodeAsync("456 Yonge St")
+    C3->>GS: GeocodeAsync("456 Yonge St")
+
+    GS->>CD: TryAdd("456 Yonge St", task) — Client 1 WINS
+    Note over CD: Client 2 & 3 see key exists → await same Task
+
+    GS->>N: ONE Nominatim call
+
+    N-->>GS: result
+    GS->>CD: TryRemove (fetch complete)
+
+    GS-->>C1: result (strategy: address)
+    GS-->>C2: result (same Task, no extra call)
+    GS-->>C3: result (same Task, no extra call)
+```
+
+---
+
 ## My approach, step by step
 
 I worked through the brief in the order the requirements were given, since each one builds on the last: normalize → geocode → fall back → cache → dedupe → throttle.
