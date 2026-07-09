@@ -48,99 +48,86 @@ public sealed class GeocodingService : IGeocodingService
     public async Task<GeocodeResult> GeocodeAsync(string rawAddress, CancellationToken ct = default)
     {
         var normalized = _normalizer.Normalize(rawAddress);
-        var taskId = Guid.NewGuid();
+
+        // Short request_id — unique per address, propagated through every log line
+        // in this async context so any single log is enough to pull the full trace.
+        var requestId = Guid.NewGuid().ToString("N")[..8];
         var totalSw = Stopwatch.StartNew();
 
-        // BeginScope attaches TaskId, RawAddress, and NormalizedAddress to every log entry
-        // emitted within this async context — including child calls in GetOrFetchAsync,
-        // FetchAndCacheAsync, etc. — without threading them as explicit parameters.
-        // Searchable by any of the three fields in log aggregators (Docker logs, ELK, Seq).
-        using (_logger.BeginScope(new Dictionary<string, object>
+        _logger.LogInformation("[{RequestId}] [Thread {ThreadId}] START raw='{Raw}' normalized='{Normalized}'",
+            requestId, Environment.CurrentManagedThreadId, rawAddress, normalized);
+
+        try
         {
-            ["TaskId"]            = taskId,
-            ["RawAddress"]        = rawAddress,
-            ["NormalizedAddress"] = normalized,
-        }))
-        {
-            _logger.LogInformation("[Thread {ThreadId}] [Task {TaskId}] Geocoding '{Raw}' → '{Normalized}'",
-                Environment.CurrentManagedThreadId, taskId, rawAddress, normalized);
+            var cached = await GetOrFetchAsync(normalized, requestId, ct);
+            var strategy = cached?.Strategy ?? "not_found";
 
-            try
-            {
-                var cached = await GetOrFetchAsync(normalized, ct);
-                var strategy = cached?.Strategy ?? "not_found";
+            totalSw.Stop();
+            _requestCounter.Add(1, new TagList { { "strategy", strategy } });
+            _requestDuration.Record(totalSw.Elapsed.TotalMilliseconds, new TagList { { "strategy", strategy } });
 
-                totalSw.Stop();
-                _requestCounter.Add(1, new TagList { { "strategy", strategy } });
-                _requestDuration.Record(totalSw.Elapsed.TotalMilliseconds, new TagList { { "strategy", strategy } });
+            _logger.LogInformation("[{RequestId}] [Thread {ThreadId}] DONE strategy={Strategy} elapsed_ms={ElapsedMs:F1}",
+                requestId, Environment.CurrentManagedThreadId, strategy, totalSw.Elapsed.TotalMilliseconds);
 
-                _logger.LogInformation("[Thread {ThreadId}] Task {TaskId} completed — strategy={Strategy} elapsed_ms={ElapsedMs:F1}",
-                    Environment.CurrentManagedThreadId, taskId, strategy, totalSw.Elapsed.TotalMilliseconds);
-
-                return cached is null
-                    ? new GeocodeResult { OriginalAddress = rawAddress, NormalizedAddress = normalized, Strategy = "not_found" }
-                    : new GeocodeResult
-                    {
-                        OriginalAddress = rawAddress,
-                        NormalizedAddress = normalized,
-                        Latitude = cached.Latitude,
-                        Longitude = cached.Longitude,
-                        DisplayName = cached.DisplayName,
-                        Strategy = cached.Strategy,
-                    };
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                totalSw.Stop();
-                _requestCounter.Add(1, new TagList { { "strategy", "error" } });
-                _requestDuration.Record(totalSw.Elapsed.TotalMilliseconds, new TagList { { "strategy", "error" } });
-
-                _logger.LogError(ex, "[Thread {ThreadId}] Task {TaskId} failed — elapsed_ms={ElapsedMs:F1}",
-                    Environment.CurrentManagedThreadId, taskId, totalSw.Elapsed.TotalMilliseconds);
-
-                return new GeocodeResult
+            return cached is null
+                ? new GeocodeResult { OriginalAddress = rawAddress, NormalizedAddress = normalized, Strategy = "not_found" }
+                : new GeocodeResult
                 {
                     OriginalAddress = rawAddress,
                     NormalizedAddress = normalized,
-                    Strategy = "error",
-                    Error = ex.Message,
-                    RetryCount = (ex is NominatimException ne) ? ne.RetryCount : null,
+                    Latitude = cached.Latitude,
+                    Longitude = cached.Longitude,
+                    DisplayName = cached.DisplayName,
+                    Strategy = cached.Strategy,
                 };
-            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            totalSw.Stop();
+            _requestCounter.Add(1, new TagList { { "strategy", "error" } });
+            _requestDuration.Record(totalSw.Elapsed.TotalMilliseconds, new TagList { { "strategy", "error" } });
+
+            _logger.LogError(ex, "[{RequestId}] [Thread {ThreadId}] ERROR elapsed_ms={ElapsedMs:F1}",
+                requestId, Environment.CurrentManagedThreadId, totalSw.Elapsed.TotalMilliseconds);
+
+            return new GeocodeResult
+            {
+                OriginalAddress = rawAddress,
+                NormalizedAddress = normalized,
+                Strategy = "error",
+                Error = ex.Message,
+                RetryCount = (ex is NominatimException ne) ? ne.RetryCount : null,
+            };
         }
     }
 
-    private async Task<CachedGeocode?> GetOrFetchAsync(string normalizedAddress, CancellationToken ct)
+    private async Task<CachedGeocode?> GetOrFetchAsync(string normalizedAddress, string requestId, CancellationToken ct)
     {
-        // Fast path: persistent cache hit (no locking needed for reads)
         var hit = await ReadFromCacheAsync(normalizedAddress, ct);
         if (hit is not null)
         {
             _cacheCounter.Add(1, new TagList { { "outcome", "hit" } });
-            _logger.LogDebug("[Thread {ThreadId}] Cache hit for '{Address}'",
-                Environment.CurrentManagedThreadId, normalizedAddress);
+            _logger.LogDebug("[{RequestId}] [Thread {ThreadId}] cache:hit '{Address}'",
+                requestId, Environment.CurrentManagedThreadId, normalizedAddress);
             return hit;
         }
 
         _cacheCounter.Add(1, new TagList { { "outcome", "miss" } });
-        _logger.LogDebug("[Thread {ThreadId}] Cache miss — joining or starting fetch for '{Address}'",
-            Environment.CurrentManagedThreadId, normalizedAddress);
+        _logger.LogDebug("[{RequestId}] [Thread {ThreadId}] cache:miss '{Address}'",
+            requestId, Environment.CurrentManagedThreadId, normalizedAddress);
 
-        // GetOrAdd is not atomic, but the Lazy wrapper is: ExecutionAndPublication ensures the
-        // factory runs exactly once even if two threads both construct a Lazy and race into GetOrAdd.
-        // .WaitAsync(ct) lets each caller cancel their own wait without cancelling the shared fetch.
         var lazy = _inFlight.GetOrAdd(normalizedAddress,
-            _ => new Lazy<Task<CachedGeocode?>>(() => FetchEvictAndCache(normalizedAddress),
+            _ => new Lazy<Task<CachedGeocode?>>(() => FetchEvictAndCache(normalizedAddress, requestId),
                  LazyThreadSafetyMode.ExecutionAndPublication));
 
         return await lazy.Value.WaitAsync(ct);
     }
 
-    private async Task<CachedGeocode?> FetchEvictAndCache(string normalizedAddress)
+    private async Task<CachedGeocode?> FetchEvictAndCache(string normalizedAddress, string requestId)
     {
         try
         {
-            return await FetchAndCacheAsync(normalizedAddress, CancellationToken.None);
+            return await FetchAndCacheAsync(normalizedAddress, requestId, CancellationToken.None);
         }
         finally
         {
@@ -156,7 +143,7 @@ public sealed class GeocodingService : IGeocodingService
             .FirstOrDefaultAsync(c => c.NormalizedAddress == normalizedAddress, ct);
     }
 
-    private async Task<CachedGeocode?> FetchAndCacheAsync(string normalizedAddress, CancellationToken ct)
+    private async Task<CachedGeocode?> FetchAndCacheAsync(string normalizedAddress, string requestId, CancellationToken ct)
     {
         var results = await _nominatim.SearchByAddressAsync(normalizedAddress, ct);
         var strategy = "address";
@@ -166,8 +153,8 @@ public sealed class GeocodingService : IGeocodingService
             var postalCode = _normalizer.ExtractPostalCode(normalizedAddress);
             if (postalCode is not null)
             {
-                _logger.LogInformation("[Thread {ThreadId}] Address not found — falling back to postal code '{PostalCode}'",
-                    Environment.CurrentManagedThreadId, postalCode);
+                _logger.LogInformation("[{RequestId}] [Thread {ThreadId}] postal_code:fallback '{PostalCode}'",
+                    requestId, Environment.CurrentManagedThreadId, postalCode);
                 results = await _nominatim.SearchByPostalCodeAsync(postalCode, ct);
                 strategy = "postal_code";
             }
@@ -175,8 +162,8 @@ public sealed class GeocodingService : IGeocodingService
 
         if (results is null || results.Length == 0)
         {
-            _logger.LogInformation("[Thread {ThreadId}] No results for '{Address}'",
-                Environment.CurrentManagedThreadId, normalizedAddress);
+            _logger.LogInformation("[{RequestId}] [Thread {ThreadId}] nominatim:not_found '{Address}'",
+                requestId, Environment.CurrentManagedThreadId, normalizedAddress);
             return null;
         }
 
@@ -191,25 +178,24 @@ public sealed class GeocodingService : IGeocodingService
             CachedAt = DateTime.UtcNow,
         };
 
-        _logger.LogInformation("[Thread {ThreadId}] Found '{Address}' via {Strategy} → lat={Lat}, lon={Lon}",
-            Environment.CurrentManagedThreadId, normalizedAddress, strategy, entry.Latitude, entry.Longitude);
-        await PersistAsync(entry, ct);
+        _logger.LogInformation("[{RequestId}] [Thread {ThreadId}] nominatim:found strategy={Strategy} lat={Lat} lon={Lon}",
+            requestId, Environment.CurrentManagedThreadId, strategy, entry.Latitude, entry.Longitude);
+        await PersistAsync(normalizedAddress, requestId, entry, ct);
         return entry;
     }
 
-    private async Task PersistAsync(CachedGeocode entry, CancellationToken ct)
+    private async Task PersistAsync(string normalizedAddress, string requestId, CachedGeocode entry, CancellationToken ct)
     {
         try
         {
             await using var db = await _dbFactory.CreateDbContextAsync(ct);
             db.CachedGeocodes.Add(entry);
             await db.SaveChangesAsync(ct);
-            _logger.LogDebug("Cached '{Address}' via {Strategy}", entry.NormalizedAddress, entry.Strategy);
+            _logger.LogDebug("[{RequestId}] cache:persisted '{Address}'", requestId, normalizedAddress);
         }
         catch (DbUpdateException)
         {
-            // Benign race: another concurrent path (or a prior run) already persisted this entry.
-            _logger.LogDebug("Cache entry for '{Address}' already exists; ignoring duplicate write", entry.NormalizedAddress);
+            _logger.LogDebug("[{RequestId}] cache:duplicate (benign race)", requestId);
         }
     }
 }
