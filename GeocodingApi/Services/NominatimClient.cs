@@ -1,6 +1,7 @@
 using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
+using Microsoft.Extensions.Configuration;
 
 namespace GeocodingApi.Services;
 
@@ -20,26 +21,26 @@ public sealed class NominatimClient : INominatimClient, IDisposable
 {
     private readonly HttpClient _http;
     private readonly ILogger<NominatimClient> _logger;
+    private readonly RateLimiter _rateLimiter;
 
-    // TokenBucketRateLimiter: 1 token/sec, FIFO queue, timer-driven replenishment.
-    // Smoother than FixedWindowRateLimiter (no edge-of-window burst) and simpler
-    // than SemaphoreSlim + manual timestamp arithmetic. Because replenishment is
-    // timer-driven (not lease-release-driven), holding the lease through the HTTP
-    // call does not delay the next token — concurrent in-flight calls are fine.
-    private readonly RateLimiter _rateLimiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
-    {
-        TokenLimit           = 1,
-        TokensPerPeriod      = 1,
-        ReplenishmentPeriod  = TimeSpan.FromSeconds(1),
-        AutoReplenishment    = true,
-        QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-        QueueLimit           = 10_000,
-    });
-
-    public NominatimClient(IHttpClientFactory httpFactory, ILogger<NominatimClient> logger)
+    public NominatimClient(IHttpClientFactory httpFactory, ILogger<NominatimClient> logger, IConfiguration config)
     {
         _http   = httpFactory.CreateClient("nominatim");
         _logger = logger;
+
+        // Configurable via Nominatim:RateLimitPerSecond (default 1 — Nominatim's public policy).
+        // TokenBucket gives smooth spacing; FixedWindow would allow back-to-back calls at window edges.
+        var rate = config.GetValue<int>("Nominatim:RateLimitPerSecond", 1);
+        _rateLimiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+        {
+            TokenLimit           = rate,
+            TokensPerPeriod      = rate,
+            ReplenishmentPeriod  = TimeSpan.FromSeconds(1),
+            AutoReplenishment    = true,
+            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+            QueueLimit           = 10_000,
+        });
+        _logger.LogInformation("Nominatim rate limiter: {Rate} req/sec", rate);
     }
 
     public Task<NominatimResult[]?> SearchByAddressAsync(string address, CancellationToken ct = default)
