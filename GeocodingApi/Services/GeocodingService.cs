@@ -65,6 +65,7 @@ public sealed class GeocodingService : IGeocodingService
                 NormalizedAddress = normalized,
                 Strategy = "error",
                 Error = ex.Message,
+                RetryCount = (ex is NominatimException ne) ? ne.RetryCount : null,
             };
         }
     }

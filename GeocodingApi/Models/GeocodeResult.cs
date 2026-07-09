@@ -15,4 +15,10 @@ public record GeocodeResult
 
     public bool Found => Latitude.HasValue;
     public string? Error { get; init; }
+
+    /// <summary>
+    /// Number of Nominatim retry attempts before the final failure.
+    /// Only populated when strategy is "error"; null otherwise.
+    /// </summary>
+    public int? RetryCount { get; init; }
 }

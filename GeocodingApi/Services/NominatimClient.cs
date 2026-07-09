@@ -4,6 +4,7 @@ using System.Net.Http.Json;
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
 using Microsoft.Extensions.Configuration;
+using Polly;
 
 namespace GeocodingApi.Services;
 
@@ -13,6 +14,16 @@ public record NominatimResult(
     [property: JsonPropertyName("display_name")] string DisplayName
 );
 
+/// <summary>
+/// Thrown when all Nominatim retry attempts are exhausted or the circuit breaker is open.
+/// Carries the number of retries that fired so callers can surface it in the response.
+/// </summary>
+public sealed class NominatimException(string message, int retryCount, Exception inner)
+    : Exception(message, inner)
+{
+    public int RetryCount { get; } = retryCount;
+}
+
 public interface INominatimClient
 {
     Task<NominatimResult[]?> SearchByAddressAsync(string address, CancellationToken ct = default);
@@ -21,11 +32,14 @@ public interface INominatimClient
 
 public sealed class NominatimClient : INominatimClient, IDisposable
 {
+    // Shared key for per-request retry tracking. The OnRetry callback in Program.cs increments
+    // this on each attempt; ThrottledGetAsync reads it back after SendAsync returns or throws.
+    public static readonly ResiliencePropertyKey<int> RetryCountKey = new("nominatim.retry_count");
+
     private readonly HttpClient _http;
     private readonly ILogger<NominatimClient> _logger;
     private readonly RateLimiter _rateLimiter;
 
-    // Metrics — one Meter per logical component; instruments are static so they survive DI rebuilds.
     private static readonly Meter _meter = new("GeocodingApi.Nominatim", "1.0");
     private static readonly Counter<long> _callCounter =
         _meter.CreateCounter<long>("nominatim.calls", description: "Total outbound Nominatim requests");
@@ -70,33 +84,37 @@ public sealed class NominatimClient : INominatimClient, IDisposable
 
         _logger.LogDebug("Nominatim → {Url}", url);
 
+        // Attach a ResilienceContext to the request so the OnRetry callback (Program.cs) can
+        // increment RetryCountKey on each attempt, and we can read the final count here.
+        var resilienceCtx = ResilienceContextPool.Shared.Get(ct);
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.SetResilienceContext(resilienceCtx);
+
         var sw = Stopwatch.StartNew();
         var outcome = "success";
         try
         {
-            var response = await _http.GetAsync(url, ct);
+            var response = await _http.SendAsync(request, ct);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadFromJsonAsync<NominatimResult[]>(ct);
         }
-        catch (HttpRequestException ex)
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
         {
             outcome = "error";
             _logger.LogError(ex, "Nominatim HTTP error for {Url}", url);
-            throw;
+            resilienceCtx.Properties.TryGetValue(RetryCountKey, out var retries);
+            throw new NominatimException(ex.Message, retries, ex);
         }
         finally
         {
             sw.Stop();
-            _callCounter.Add(1, new TagList
-            {
-                { "path", path },
-                { "outcome", outcome },
-            });
-            _callDuration.Record(sw.Elapsed.TotalMilliseconds, new TagList
-            {
-                { "path", path },
-                { "outcome", outcome },
-            });
+            ResilienceContextPool.Shared.Return(resilienceCtx);
+            _callCounter.Add(1, new TagList { { "path", path }, { "outcome", outcome } });
+            _callDuration.Record(sw.Elapsed.TotalMilliseconds, new TagList { { "path", path }, { "outcome", outcome } });
         }
     }
 

@@ -82,6 +82,11 @@ builder.Services.AddHttpClient("nominatim", client =>
         },
         OnRetry = args =>
         {
+            // Increment per-request retry counter stored in the resilience context so
+            // NominatimClient can read it back after SendAsync and expose it in the response.
+            args.Context.Properties.TryGetValue(NominatimClient.RetryCountKey, out var count);
+            args.Context.Properties.Set(NominatimClient.RetryCountKey, count + 1);
+
             logger.LogWarning("Nominatim transient failure — retry {Attempt}/{Max} in {Delay}s. Reason: {Reason}",
                 args.AttemptNumber + 1, retryCount,
                 args.RetryDelay.TotalSeconds,

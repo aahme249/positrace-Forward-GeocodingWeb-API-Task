@@ -79,7 +79,8 @@ curl -X POST http://localhost:8080/api/v1/geocode \
       "displayName": "123, Main Street, ...",
       "strategy": "address",
       "found": true,
-      "error": null
+      "error": null,
+      "retryCount": null
     }
   ]
 }
@@ -89,12 +90,28 @@ Results are returned in the same order and count as the input list, and each one
 
 ### `strategy` values
 
-| Value | Meaning |
-|---|---|
-| `address` | Nominatim matched the normalised street address |
-| `postal_code` | Address query returned nothing; result comes from the postal code |
-| `not_found` | Neither query returned results |
-| `error` | Nominatim was unreachable or returned an HTTP error |
+| Value | Meaning | `error` | `retryCount` |
+|---|---|---|---|
+| `address` | Nominatim matched the normalised street address | null | null |
+| `postal_code` | Address query returned nothing; result comes from the postal code | null | null |
+| `not_found` | Neither query returned results | null | null |
+| `error` | Nominatim was unreachable or returned an HTTP error | exception message | retries fired before giving up |
+
+**Example error response:**
+
+```json
+{
+  "originalAddress": "123 Main St, Toronto, ON",
+  "normalizedAddress": "123 Main St, Toronto, ON",
+  "latitude": null,
+  "longitude": null,
+  "displayName": null,
+  "strategy": "error",
+  "found": false,
+  "error": "No such host is known. (invalid.example:80)",
+  "retryCount": 3
+}
+```
 
 ---
 
@@ -241,8 +258,6 @@ return await lazy.Value.WaitAsync(ct);
 
 The correctness guarantee is identical. The code surface area is smaller and the intent is immediately readable.
 
-**Why not `IMemoryCache.GetOrCreateAsync`:**
-
 ### Why not `IMemoryCache.GetOrCreateAsync` for deduplication
 
 `IMemoryCache.GetOrCreateAsync` does not provide single-flight semantics — if two requests arrive simultaneously and both miss the cache, both execute the factory and both call Nominatim. The `ConcurrentDictionary` pattern here is more correct because `TryAdd` is atomic: only one caller wins the race and the rest await the winner's `Task`. A library like `LazyCache` (which wraps `Lazy<Task<T>>` inside `IMemoryCache`) would provide the same guarantee with a cleaner API, and is the natural next step if the dedup logic grows more complex.
@@ -342,11 +357,13 @@ histogram_quantile(0.95, rate(nominatim_call_duration_milliseconds_bucket[5m])) 
 **Triggering errors to test the error panels** — point the service at an invalid Nominatim URL without rebuilding:
 
 ```bash
-docker compose down
+docker compose down -v
 Nominatim__BaseUrl=http://invalid.example/ docker compose up
 ```
 
-Send any request with a cold-cache address — the response will show `"strategy": "error"` and the Grafana error rate panel will spike. Restart normally with `docker compose down && docker compose up` to restore.
+The `-v` flag wipes the cache volume so no cached results short-circuit the error path. Send any address — the response will show `"strategy": "error"`, `"retryCount": 3`, and the error message from the HTTP client. The Grafana error rate panel will spike after a few requests. After 5 consecutive failures the circuit breaker opens and `"error"` will read `"The circuit is now open and is not allowing calls."` with `"retryCount": 0` (no retries — fast-fail path).
+
+Restart normally with `docker compose down && docker compose up` to restore.
 
 View live in the terminal while the service is running:
 
@@ -385,7 +402,7 @@ dotnet test GeocodingApi.Tests/
 | Suite | Coverage |
 |---|---|
 | `AddressNormalizerTests` | Every normalization rule: dash-unit, Apt, Unit (including spaced-letter suffix), Suite/Ste, Room, Hash, French App./No./Bureau; postal code extraction |
-| `GeocodingServiceTests` | Address strategy, postal code fallback, not-found, cache hit on second call, normalization-to-cache-key collapse, concurrent deduplication (5 goroutines → 1 Nominatim call), per-address error isolation |
+| `GeocodingServiceTests` | Address strategy, postal code fallback, not-found, cache hit on second call, normalization-to-cache-key collapse, concurrent deduplication (5 concurrent tasks → 1 Nominatim call), per-address error isolation |
 
 Integration tests use real SQLite (in-memory) and a mocked `INominatimClient` — no live HTTP calls.
 
