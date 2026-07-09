@@ -62,8 +62,8 @@ public sealed class GeocodingService : IGeocodingService
             ["NormalizedAddress"] = normalized,
         }))
         {
-            _logger.LogInformation("[Thread {ThreadId}] Geocoding '{Raw}' → '{Normalized}'",
-                Environment.CurrentManagedThreadId, rawAddress, normalized);
+            _logger.LogInformation("[Thread {ThreadId}] [Task {TaskId}] Geocoding '{Raw}' → '{Normalized}'",
+                Environment.CurrentManagedThreadId, taskId, rawAddress, normalized);
 
             try
             {
