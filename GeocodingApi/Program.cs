@@ -13,6 +13,7 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddOpenTelemetry()
     .WithMetrics(m => m
         .AddMeter("GeocodingApi.Nominatim")
+        .AddMeter("GeocodingApi.Geocoding")
         .AddPrometheusExporter());
 
 // ── Controllers + JSON ────────────────────────────────────────────────────────
