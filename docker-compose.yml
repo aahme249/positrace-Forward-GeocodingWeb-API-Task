@@ -11,6 +11,24 @@ services:
       - Nominatim__UserAgent=Positrace-Geocoding-Service/1.0 (asifahmed3959@gmail.com)
       - Nominatim__BaseUrl=${Nominatim__BaseUrl:-https://nominatim.openstreetmap.org/}
 
+  loki:
+    image: grafana/loki:2.9.4
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - loki-data:/loki
+
+  promtail:
+    image: grafana/promtail:2.9.4
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./promtail.yml:/etc/promtail/config.yml:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
   prometheus:
     image: prom/prometheus:v2.53.0
     ports:
@@ -37,3 +55,4 @@ services:
 
 volumes:
   geocoding-data:
+  loki-data:
