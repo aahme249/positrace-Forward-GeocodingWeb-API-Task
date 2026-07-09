@@ -80,7 +80,7 @@ curl -X POST http://localhost:8080/api/v1/geocode \
       "strategy": "address",
       "found": true,
       "error": null,
-      "retryCount": null
+      "retryCount": 0
     }
   ]
 }
@@ -90,12 +90,17 @@ Results are returned in the same order and count as the input list, and each one
 
 ### `strategy` values
 
+`retryCount` is the total number of *extra* Nominatim requests beyond the first for that address —
+Polly retries on either the address or postal-code call, plus 1 if the postal-code fallback was
+attempted at all (a second request in its own right, whether or not it needed retries). It's `null`
+only on a cache hit, where no Nominatim call happened; otherwise it's a real number, `0` included.
+
 | Value | Meaning | `error` | `retryCount` |
 |---|---|---|---|
-| `address` | Nominatim matched the normalised street address | null | null |
-| `postal_code` | Address query returned nothing; result comes from the postal code | null | null |
-| `not_found` | Neither query returned results | null | null |
-| `error` | Nominatim was unreachable or returned an HTTP error | exception message | retries fired before giving up |
+| `address` | Nominatim matched the normalised street address | null | `0`+ (cache hit: null) |
+| `postal_code` | Address query returned nothing; result comes from the postal code | null | `1`+ (fallback itself counts as 1) |
+| `not_found` | Neither query returned results | null | `0`+ (or `1`+ if postal fallback was attempted) |
+| `error` | Nominatim was unreachable or returned an HTTP error | exception message | retries fired across whichever call ultimately failed |
 
 **Example error response:**
 
@@ -291,7 +296,11 @@ French directional suffix `O` is expanded to `Ouest` before the query is sent �
 
 Three layers protect against Nominatim being slow or unavailable:
 
-**Retry** — on a transient failure (5xx, timeout, `HttpRequestException`), retries up to `Nominatim:RetryCount` (default 3) times with a fixed `Nominatim:RetryDelaySeconds` (default 2 s) between attempts.
+**Retry** — on a transient failure (5xx, network error, or a per-attempt timeout —
+`HttpRequestException`, `TaskCanceledException`, and `Polly.Timeout.TimeoutRejectedException` are
+all treated as retryable), retries up to `Nominatim:RetryCount` (default 3) times with a fixed
+`Nominatim:RetryDelaySeconds` (default 2 s) between attempts. Each retry is logged with an
+incrementing `retry_count` and the failure reason — see [Logging & configuration](#logging--configuration).
 
 **Timeout** — each individual attempt times out after `Nominatim:TimeoutSeconds` (default 5 s).
 
@@ -309,19 +318,72 @@ info:  Nominatim circuit breaker CLOSED — Nominatim is reachable again
 
 ## Logging & configuration
 
-Structured logs are emitted at every stage with thread IDs so individual addresses can be traced across a concurrent batch:
+Every log line is one rendered [logfmt](https://brandur.org/logfmt) string, not a templated
+message — Docker → Promtail → Loki only ever ships console text, not .NET's structured log
+properties. Same field set on every line, so one line is enough to filter on in Loki.
 
-| Event | Level |
+**Fields (every line)**
+
+| Field | Meaning |
 |---|---|
-| Incoming request | `Info` |
-| Normalization applied | `Info` |
-| Cache hit | `Debug` |
-| In-flight dedup join | `Debug` |
-| Postal code fallback | `Info` |
-| Result found + coordinates | `Info` |
-| Nominatim call fired | `Debug` |
-| Retry | `Warning` |
-| Circuit opened / closed | `Error` / `Info` |
+| `timestamp` | UTC ISO 8601, set when the event fires |
+| `level` | `info` / `debug` / `warn` / `error` |
+| `service` | `GeocodingService` or `NominatimClient` |
+| `batch_request_id` | One per `POST /api/v1/geocode` call, shared by every address in that batch |
+| `nominatim_request_id` | One per outbound Nominatim HTTP call (address search and postal fallback get different IDs). `-` if no call is in flight (cache hit, dedup join, batch-level lines) |
+| `thread_id` | Managed thread handling that step — distinguishes interleaved addresses in one batch |
+| `raw_address` | Original input, for searching |
+| `normalized_address` | After `AddressNormalizer.Normalize`; also the SQLite cache key |
+| `event` | See tables below |
+
+Some events add trailing fields (`strategy=`, `retry_count=`, etc.), noted per-event.
+
+**`GeocodingService` events**
+
+| Event | Level | Fires when | Extra fields |
+|---|---|---|---|
+| `start` | info | Start of `GeocodeAsync` | — |
+| `cache_hit` | debug | Found in SQLite — no Nominatim call | — |
+| `cache_miss` | debug | Not cached — proceeds to fetch | — |
+| `dedup_join` | debug | Joined another in-flight fetch for the same address instead of starting one | — |
+| `postal_fallback` | info | Address search empty; retrying by postal code | `postal_code` |
+| `nominatim_found` | info | Result found (address or postal search) | `strategy`, `lat`, `lon` |
+| `nominatim_not_found` | info | No result from either search | — |
+| `persisted` | debug | Result written to cache | — |
+| `duplicate` | debug | Cache write hit unique-index race (benign) | — |
+| `done` | info | Request finished (success/not_found) | `strategy`, `elapsed_ms` |
+| `error` | error | Unhandled exception, replaces `done` | `elapsed_ms`, `error` |
+
+**`NominatimClient` events** — one outbound call (`nominatim_request_id`), incl. Polly retries:
+
+| Event | Level | Fires when | Extra fields |
+|---|---|---|---|
+| `call_sent` | debug | First attempt sent | `url`, `retry_count=0` |
+| `retry` | warn | Retrying after a transient failure | `retry_count`, `attempt`, `max`, `delay_s`, `reason` |
+| `call_success` | debug | Call succeeded (first try or after retries) | `url`, `retry_count` |
+| `call_error` | error | Retries/circuit breaker exhausted | `url`, `retry_count`, `error` |
+
+`retry_count` starts at `0`, increments per retry in `Program.cs`'s `OnRetry` — `0` on first-try
+success, matches the number of `retry` lines before a `call_error`.
+
+**Example** (live capture — cache miss, found on the first try; two of the seven lines this
+address produces, showing the full shape):
+
+```
+timestamp=2026-07-09T20:06:46.190Z level=info service=GeocodingService batch_request_id=93459637 nominatim_request_id=- thread_id=5 raw_address="350 Sparks St, Ottawa, ON K1R 7S8" normalized_address="350 Sparks St, Ottawa, ON K1R 7S8" event=start
+timestamp=2026-07-09T20:06:47.501Z level=info service=GeocodingService batch_request_id=93459637 nominatim_request_id=de0329b2 thread_id=5 raw_address="350 Sparks St, Ottawa, ON K1R 7S8" normalized_address="350 Sparks St, Ottawa, ON K1R 7S8" event=nominatim_found strategy=address lat=45.4188263 lon=-75.7056622
+```
+
+Note `nominatim_request_id` goes from `-` on `start` (no Nominatim call yet) to a real ID on
+`nominatim_found` once the outbound call happened, while `batch_request_id` stays the same across
+every line for this request — that's the pattern the whole `start → cache_miss → call_sent →
+call_success → nominatim_found → persisted → done` sequence follows.
+
+`Logging:Console:SingleLine` (`appsettings.json`) keeps each event on one line — otherwise the
+default console formatter splits it into two, which Promtail ships as two separate Loki entries.
+
+Circuit-breaker transition logs (`OPENED`/`HALF-OPEN`/`CLOSED`, see above) aren't in this format
+yet — they're process-wide, not tied to a `batch_request_id`.
 
 To see logs when running via Docker: `docker compose logs -f`.
 

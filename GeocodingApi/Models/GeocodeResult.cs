@@ -17,8 +17,11 @@ public record GeocodeResult
     public string? Error { get; init; }
 
     /// <summary>
-    /// Number of Nominatim retry attempts before the final failure.
-    /// Only populated when strategy is "error"; null otherwise.
+    /// Total number of extra Nominatim requests beyond the first — Polly retries on either call,
+    /// plus 1 if the postal-code fallback was attempted at all (a second request, whether or not
+    /// it needed its own retries). Populated for every strategy where at least one Nominatim call
+    /// was made ("address", "postal_code", "not_found", "error"); null only for a cache hit, where
+    /// no Nominatim call happened.
     /// </summary>
     public int? RetryCount { get; init; }
 }

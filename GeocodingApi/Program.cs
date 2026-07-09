@@ -77,21 +77,35 @@ builder.Services.AddHttpClient("nominatim", client =>
         BackoffType      = DelayBackoffType.Constant,
         ShouldHandle     = args => args.Outcome switch
         {
-            { Exception: HttpRequestException or TaskCanceledException } => PredicateResult.True(),
-            { Result.IsSuccessStatusCode: false }                        => PredicateResult.True(),
-            _                                                            => PredicateResult.False()
+            // TimeoutRejectedException is what the per-attempt AddTimeout below throws when
+            // Nominatim is slow to respond — a Nominatim outage/slowdown shows up as this, not
+            // as TaskCanceledException, so it has to be listed explicitly or a slow Nominatim
+            // never gets retried at all (retry_count stays 0, no retry line is ever logged).
+            { Exception: HttpRequestException or TaskCanceledException or Polly.Timeout.TimeoutRejectedException } => PredicateResult.True(),
+            { Result.IsSuccessStatusCode: false }                                                                  => PredicateResult.True(),
+            _                                                                                                      => PredicateResult.False()
         },
         OnRetry = args =>
         {
-            // Increment per-request retry counter stored in the resilience context so
-            // NominatimClient can read it back after SendAsync and expose it in the response.
+            // Increment per-request retry counter stored in the resilience context (seeded to 0
+            // in NominatimClient.ThrottledGetAsync) so NominatimClient can read the final count
+            // back after SendAsync and expose it in the response.
             args.Context.Properties.TryGetValue(NominatimClient.RetryCountKey, out var count);
-            args.Context.Properties.Set(NominatimClient.RetryCountKey, count + 1);
+            var newCount = count + 1;
+            args.Context.Properties.Set(NominatimClient.RetryCountKey, newCount);
 
-            logger.LogWarning("Nominatim transient failure — retry {Attempt}/{Max} in {Delay}s. Reason: {Reason}",
-                args.AttemptNumber + 1, retryCount,
-                args.RetryDelay.TotalSeconds,
-                args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString());
+            // Same trace fields, same logfmt shape as every other log line — set alongside
+            // RetryCountKey in ThrottledGetAsync — so a retry is visible in the same
+            // batch_request_id / nominatim_request_id trace instead of a disconnected warning.
+            args.Context.Properties.TryGetValue(NominatimClient.BatchRequestIdKey, out var batchRequestId);
+            args.Context.Properties.TryGetValue(NominatimClient.NominatimRequestIdKey, out var nominatimRequestId);
+            args.Context.Properties.TryGetValue(NominatimClient.RawAddressKey, out var rawAddress);
+            args.Context.Properties.TryGetValue(NominatimClient.NormalizedAddressKey, out var normalizedAddress);
+
+            logger.LogWarning(NominatimClient.Fmt("warn", batchRequestId ?? "-", nominatimRequestId ?? "-",
+                rawAddress ?? "-", normalizedAddress ?? "-", "retry",
+                $"retry_count={newCount} attempt={args.AttemptNumber + 1} max={retryCount} delay_s={args.RetryDelay.TotalSeconds} " +
+                $"reason=\"{args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString()}\""));
             return ValueTask.CompletedTask;
         }
     });

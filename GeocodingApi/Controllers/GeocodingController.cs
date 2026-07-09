@@ -31,7 +31,7 @@ public class GeocodingController(IGeocodingService geocodingService) : Controlle
     /// Each Nominatim call times out after `Nominatim:TimeoutSeconds` (default 5 s) and is retried up to `Nominatim:RetryCount` times (default 3) with `Nominatim:RetryDelaySeconds` (default 2 s) between attempts. All values are configurable in `appsettings.json`.
     ///
     /// **Recommended batch size:** under 50 addresses for sub-minute response times.
-    /// </remarks>okay 
+    /// </remarks>
     [HttpPost]
     [ProducesResponseType(typeof(GeocodeResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]
@@ -40,7 +40,12 @@ public class GeocodingController(IGeocodingService geocodingService) : Controlle
         if (request.Addresses.Count == 0)
             return BadRequest(new { error = "Addresses list must not be empty." });
 
-        var tasks = request.Addresses.Select(addr => geocodingService.GeocodeAsync(addr, ct));
+        // One batch_request_id per incoming batch, shared by every address's log lines so the
+        // whole batch can be traced with a single Loki query regardless of which address
+        // or thread handled it.
+        var batchRequestId = Guid.NewGuid().ToString("N")[..8];
+
+        var tasks = request.Addresses.Select(addr => geocodingService.GeocodeAsync(addr, batchRequestId, ct));
         var results = await Task.WhenAll(tasks);
 
         return Ok(new GeocodeResponse(results));
