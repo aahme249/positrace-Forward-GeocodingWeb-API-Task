@@ -349,21 +349,44 @@ Sending the same address 5 times in one batch results in a single Nominatim call
 
 ### Weaknesses of this approach
 
-- **In-process rate limiter doesn't scale horizontally.** Running two instances of this service would double the Nominatim request rate. The `SemaphoreSlim` lives in one process — there's no distributed coordination. Mitigation: add a Redis-backed distributed rate limiter, or put a single Nominatim-facing worker behind an internal queue.
-- **No per-client fairness.** A single client submitting 200 cold addresses monopolises the rate limiter for ~200 seconds, blocking all other clients' new addresses. Cached requests are unaffected, but new-address requests from other clients queue behind the large batch. Mitigation: per-client request queues with round-robin dispatch.
-- **No batch size limit enforced.** A caller can send 1 000 addresses and hold an HTTP connection open for ~16 minutes. Mitigation: cap batch size (e.g. 50) and recommend async job submission for larger workloads.
-- **In-flight dedup state is in-memory only.** If the service restarts mid-fetch, the task is lost. The persistent cache means completed results survive restarts; only the in-progress ones are lost and must be retried by the caller.
+- **In-process rate limiter doesn't scale horizontally.** Running two instances doubles the Nominatim request rate — `TokenBucketRateLimiter` lives in one process with no distributed coordination. Mitigation: Redis-backed distributed rate limiter, or a single Nominatim-facing worker behind an internal queue.
+- **No per-client fairness.** A single client submitting 200 cold addresses monopolises the rate limiter for ~200 seconds, blocking all other clients' new addresses. Cached requests are unaffected. Mitigation: per-client request queues with round-robin dispatch.
+- **No batch size limit enforced.** A caller can send 1,000 addresses and hold an HTTP connection open for ~17 minutes. Mitigation: cap batch size (e.g. 50) and recommend async job submission for larger workloads.
+- **In-flight dedup state is in-memory only.** If the service restarts mid-fetch, in-progress tasks are lost. Completed results survive via the persistent cache; only the in-progress ones must be retried by the caller.
 
-### Is there a better way?
+---
 
-For this use case (Canadian vehicle fleet, recurring routes) — **no, not meaningfully.** The combination of persistent cache + in-flight dedup + rate limiter handles the dominant patterns well. The weaknesses only matter at scale:
+## Scalability in numbers
 
-| Scale trigger | Better approach |
-|---|---|
-| Multiple service instances | Shared Redis rate limiter + distributed cache |
-| Batches regularly > 50 addresses | Async job queue (see Future considerations) |
-| High volume of genuinely new addresses | Self-hosted Nominatim (no rate limit, full fan-out) |
-| Per-client fairness required | Priority queue with per-tenant slots |
+### Current capacity (single instance, public Nominatim)
+
+| Scenario | Throughput | Notes |
+|---|---|---|
+| Warm cache (all cached) | **~1,000 addresses/sec** | SQLite SELECT, ~1ms each |
+| Cold cache (all new) | **1 address/sec** | Hard ceiling — Nominatim's 1 req/s policy |
+| Mixed (typical fleet) | **~1,000 cached + 1 cold/sec** | After day 1, most routes are cached |
+| 10 cold addresses | **~10 seconds** | 1 Nominatim call/sec, overlapping in-flight |
+| 50 cold addresses | **~50 seconds** | Recommended max batch size |
+| 100 cold addresses | **~1 min 40 sec** | Connection held open — approaching timeout risk |
+| 1,000 cold addresses | **~17 minutes** | Should use async job queue instead |
+| Per day (cold) | **~86,400 unique addresses** | 1/sec × 86,400 seconds/day |
+| Per hour (cold) | **~3,600 unique addresses** | Practical ceiling for new-route ingestion |
+
+### How to improve it
+
+| Improvement | What changes | Numbers after |
+|---|---|---|
+| **Cap batch size at 50** | Return `400 Bad Request` above 50 addresses | Max response time bounded to ~50s |
+| **Async job queue** (`Channel<T>` or Redis Streams) | `POST` returns a job ID; client polls `GET /jobs/{id}` | Handles 10,000+ address batches without holding connections |
+| **Redis distributed cache** | Replace SQLite with Redis shared across all pods | 100,000+ cached reads/sec; survives pod restarts |
+| **Redis distributed rate limiter** | Replace in-process `TokenBucketRateLimiter` | Multiple pods share one 1 req/sec gate — safe to scale horizontally |
+| **Self-hosted Nominatim** (Canada extract, ~50 GB) | Private OSM instance, no rate limit | 50–200 geocodes/sec on commodity hardware; unlimited fan-out |
+| **Self-hosted + worker pool (10 workers)** | 10 concurrent threads against private Nominatim | ~500–2,000 addresses/sec; same-day geocoding of a national fleet |
+
+### Practical scale ceiling without any changes
+
+> One instance, public Nominatim, high cache-hit fleet:
+> **~1 million cached lookups/day** + **~86,400 new addresses/day** — comfortably handles a fleet of hundreds of vehicles revisiting known routes, with capacity headroom for new-route discovery.
 
 ---
 
