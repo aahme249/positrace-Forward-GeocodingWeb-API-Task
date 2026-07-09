@@ -73,7 +73,7 @@ curl -X POST http://localhost:8080/api/v1/geocode \
   "results": [
     {
       "originalAddress": "123-12 Main St, Toronto, ON M5V 2T6",
-      "normalizedAddress": "123 Main St, Toronto, ON M5V 2T6",
+      "normalizedAddress": "12 Main St, Toronto, ON M5V 2T6",
       "latitude": 43.6532,
       "longitude": -79.3832,
       "displayName": "123, Main Street, ...",
@@ -275,7 +275,7 @@ The correctness guarantee is identical. The code surface area is smaller and the
 
 **Rules applied in order:**
 
-1. Dash-prefixed unit at the very start of the string (`123-12 Main St` → `123 Main St`) — done first so later passes don't shift the leading digits
+1. Dash-prefixed unit at the very start of the string — Canada Post convention is `unit-civic` (e.g. `4-123 Main St` = unit 4, civic number 123), so the leading number is dropped and the trailing one kept: `123-12 Main St` → `12 Main St` — done first so later passes don't shift the leading digits
 2. English qualifiers: `Apt`/`Apt.`, `Unit`, `Suite`/`Ste`/`Ste.`, `Room`, `Building`/`Bldg`, `Floor`/`Fl`, `#`
 3. French qualifiers: `App`/`App.` (Appartement), `No`/`No.` (Numéro), `Bureau`
 4. Collapse orphaned whitespace and commas left by removals
@@ -286,7 +286,8 @@ French directional suffix `O` is expanded to `Ouest` before the query is sent �
 
 **Known limitations:**
 
-- The dash-prefix rule only fires at the very start of the trimmed address — civic number always comes first in Canadian addressing, so this is correct for all real inputs.
+- The dash-prefix rule only fires at the very start of the trimmed address and only matches `\d+-\d+` — a range-style civic address (`123-125 Main St`, spanning two lots) would be misread as unit `123`/civic `125` since both forms are indistinguishable by pattern alone. Genuine unit-civic addresses are far more common in the Canadian residential/commercial mail stream this service targets, so that's the assumption encoded here.
+- Alphanumeric unit identifiers before the dash (`12A-123 Main St`) are not stripped — the pattern requires digits on both sides of the dash, so a non-numeric unit passes through unnormalized and will likely fail to geocode.
 - French street type prefixes (`Rue`, `Avenue`, `Boulevard`) are not interchangeable in OSM. If the input says `Rue McGill College` but OSM indexes it as `Avenue McGill College`, the address search returns nothing. The postal code fallback recovers the location if the postal code is indexed — if neither is, the result is `not_found`. This is an input data quality issue, not a normalisation bug; the fix is to use the correct street type in the source address.
 - Some Quebec postal codes are absent from Nominatim's OSM dataset. When both the address search and the postal code fallback return empty, `not_found` is returned rather than an error.
 

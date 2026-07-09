@@ -8,9 +8,11 @@ public class AddressNormalizerTests
     private readonly AddressNormalizer _sut = new();
 
     [Theory]
-    [InlineData("123-12 Main St, Toronto, ON", "123 Main St, Toronto, ON")]
-    [InlineData("456-7 Bathurst St, Toronto, ON M5T 2S5", "456 Bathurst St, Toronto, ON M5T 2S5")]
-    public void DashUnit_StripsLeadingCivicDashPrefix(string input, string expected)
+    // Canada Post convention: "unit-civic" — "123-12 Main St" is unit 123 at 12 Main St, so the
+    // leading number (the unit) is dropped and the trailing number (the civic number) is kept.
+    [InlineData("123-12 Main St, Toronto, ON", "12 Main St, Toronto, ON")]
+    [InlineData("456-7 Bathurst St, Toronto, ON M5T 2S5", "7 Bathurst St, Toronto, ON M5T 2S5")]
+    public void DashUnit_StripsLeadingUnitDashPrefix(string input, string expected)
         => Assert.Equal(expected, _sut.Normalize(input));
 
     [Theory]

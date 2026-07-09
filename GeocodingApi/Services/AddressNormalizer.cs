@@ -14,9 +14,11 @@ public partial class AddressNormalizer : IAddressNormalizer
     [GeneratedRegex(@"\b([A-Za-z]\d[A-Za-z])\s?(\d[A-Za-z]\d)\b")]
     private static partial Regex PostalCodeRegex();
 
-    // Dash-prefixed unit: leading civic-number dash unit-number (e.g. "123-12 Main St" → "123 Main St")
+    // Dash-prefixed unit: Canada Post's addressing convention is "unit number - civic number"
+    // (e.g. "4-123 Main St" = unit 4, civic number 123), so the leading number is the unit to
+    // discard and the second is the real street number to keep: "123-12 Main St" → "12 Main St".
     // Must run first — anchors on the leading digits before other passes alter them.
-    [GeneratedRegex(@"^(\d+)-\d+\b")]
+    [GeneratedRegex(@"^\d+-(\d+)\b")]
     private static partial Regex DashUnitRegex();
 
     // Unit identifier pattern used across English and French qualifiers.

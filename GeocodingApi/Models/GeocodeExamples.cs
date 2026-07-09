@@ -43,9 +43,9 @@ public class GeocodeExampleFilter : IOperationFilter
         {
             ["results"] = new OpenApiArray
             {
-                // 1. dash-unit strip → not_found (fake street number)
+                // 1. dash-unit strip (unit 123, civic 12 per Canada Post convention) → not_found (fake street number)
                 Result("123-12 Main St, Toronto, ON M5V 2T6",
-                       "123 Main St, Toronto, ON M5V 2T6",
+                       "12 Main St, Toronto, ON M5V 2T6",
                        strategy: "not_found"),
 
                 // 2. Apt. qualifier → address
