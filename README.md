@@ -555,6 +555,54 @@ A background worker reads from an in-process `Channel<T>` (or an external broker
 
 Using the public Nominatim endpoint caps throughput at 1 req/sec per IP regardless of architecture. Running a private Nominatim instance (open source, ~50 GB disk for Canada-only extract) removes the rate limit entirely, allows fan-out to a worker pool, and eliminates the dependency on a third-party service — the right call once geocoding volume justifies the infrastructure cost.
 
+### At-scale testing (1 million addresses)
+
+Testing against public Nominatim at 1 million addresses is not feasible — at 1 req/sec that is 11.6 days of continuous calls, and the IP would be banned well before completion. The correct path at that volume:
+
+1. **Self-hosted Nominatim** — Canada OSM extract (~50 GB), no rate limit
+2. **Worker pool** — 100 concurrent workers against the private instance
+3. **Time to geocode 1 million** — ~3 hours (1,000,000 ÷ ~100 req/sec)
+4. **After completion** — everything is in the cache; all future lookups return in milliseconds
+
+### Horizontal scaling
+
+The current in-process `TokenBucketRateLimiter` is the blocker for horizontal scaling — two pods would send 2 req/sec to Nominatim, violating the usage policy. The fix is to move the rate-limit gate into a shared layer: a load balancer distributes inbound requests across N pods, all pods read/write a shared Redis cache, and a single Redis-backed distributed rate limiter enforces the 1 req/sec global budget before any pod calls Nominatim. With self-hosted Nominatim the rate limit is removed entirely and the worker pool can scale freely.
+
+Changes required:
+- Replace `TokenBucketRateLimiter` with a Redis-backed rate limiter (sliding window via `INCR` + `EXPIRE`)
+- Replace SQLite with Redis or Postgres so all pods share one cache
+- All other logic (normaliser, dedup, fallback, Polly pipeline) stays unchanged
+- With self-hosted Nominatim, raise `Nominatim:RateLimitPerSecond` to match worker pool size
+
+### Scaling to 1 million requests
+
+At 1 million addresses, roughly 90% will be cache hits after the first day (vehicles revisiting known routes), returning in ~1ms each. The remaining 10% new addresses are enqueued as async jobs, drained by a 100-worker pool against a self-hosted Nominatim instance at ~100 req/sec — completing in ~17 minutes. With a nightly prefetch of all known route addresses, day-2 onwards the entire million-address batch returns in seconds with zero Nominatim calls.
+
+### Prefetch — eliminating all overhead for known routes
+
+The single most effective optimisation for a vehicle fleet is **eager prefetching**: geocode every known route address at startup or overnight, rather than waiting for a vehicle to submit it.
+
+```
+Background job (nightly) → reads route database → calls /api/v1/geocode in batches
+                                                 → results written to SQLite cache
+
+Vehicle submits batch at runtime → 100% cache hit → returns in ~5 ms → zero Nominatim calls
+```
+
+With a full prefetch, the entire Nominatim pipeline (rate limiter, retry, circuit breaker, fallback) becomes invisible to the caller on the hot path. The service degrades gracefully to on-demand geocoding only for genuinely new addresses not in the prefetch set. This eliminates all response-time variability for known routes and makes the 1 req/sec constraint irrelevant for day-to-day fleet operations.
+
+### Limitations of the current design
+
+| Limitation | Impact | Mitigation |
+|---|---|---|
+| Public Nominatim 1 req/sec | Max 3,600 new addresses/hour, 86,400/day | Self-hosted Nominatim |
+| In-process rate limiter | Cannot run more than one pod safely | Redis distributed rate limiter |
+| SQLite single-writer | Not safe across multiple pods | Postgres or Redis shared cache |
+| No batch size cap | 1,000 addresses = 17-minute open connection | Enforce max 50; async job queue above that |
+| No per-client fairness | Large batch monopolises queue for all clients | Per-tenant rate limit slots |
+| In-memory dedup state | Lost on restart (completed results survive) | Acceptable for this scope |
+| No prefetch | First-run cold batches are slow | Nightly prefetch job for known routes |
+
 ---
 
 ## Development tooling
