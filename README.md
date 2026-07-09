@@ -287,9 +287,70 @@ The two concerns (rate limiting and failure recovery) are kept in separate layer
 
 ## Transient failures & operational visibility
 
-- **Transient failures:** `NominatimClient.EnsureSuccessStatusCode()` throws on non-2xx responses; `GeocodingService.GeocodeAsync` catches per-address, not per-batch, so one bad address returns `strategy: "error"` with the exception message instead of failing the whole request. Because the failure happens inside the in-flight task, every concurrent waiter on that same address also receives the exception (via `tcs.SetException`) rather than hanging indefinitely.
-- **Logging:** every stage logs through `ILogger<T>` — normalisation result, cache hit/miss, in-flight wait, postal-code fallback trigger, rate-limit delay, outbound URL — at `Information`/`Debug`, so a production deployment can trace which path a given address took without attaching a debugger. Levels are tunable per-namespace in `appsettings.json`.
-- **Configuration:** Nominatim base URL, User-Agent (required by Nominatim's usage policy — set to a real contact address), and the SQLite connection string are all externalised via `appsettings.json` / environment variables (see `docker-compose.yml`), not hardcoded, so they can change without a rebuild.
+### Transient failure handling
+
+Three layers protect against Nominatim being slow or unavailable:
+
+**1. Retry with configurable back-off**
+Every outbound call goes through a Polly resilience pipeline. On a transient failure (5xx, timeout, `HttpRequestException`) it retries up to `Nominatim:RetryCount` times (default 3) with a fixed `Nominatim:RetryDelaySeconds` (default 2 s) between attempts. Each retry is logged at `Warning` level:
+```
+warn: NominatimResilience — retry 1/3 in 2s. Reason: 503 ServiceUnavailable
+```
+
+**2. Per-attempt timeout**
+Each individual attempt times out after `Nominatim:TimeoutSeconds` (default 5 s), preventing a slow Nominatim response from blocking a thread indefinitely. The outer `HttpClient.Timeout` covers all retries combined (`TimeoutSeconds × (RetryCount + 1)`).
+
+**3. Circuit breaker**
+If `Nominatim:CircuitBreakerFailures` (default 5) consecutive calls all fail within a 30 s window, the circuit opens. All further calls fail immediately (no waiting, no retries) for `Nominatim:CircuitBreakerBreakSeconds` (default 30 s). After the break, one probe call goes through (half-open state) — if it succeeds the circuit closes; if not, it stays open another 30 s. Every state transition is logged:
+```
+error: Nominatim circuit breaker OPENED — 5 consecutive failures. All geocode calls will fail fast for 30s.
+warn:  Nominatim circuit breaker HALF-OPEN — sending probe request to test connectivity
+info:  Nominatim circuit breaker CLOSED — Nominatim is reachable again
+```
+
+**4. Per-address error isolation**
+`GeocodingService.GeocodeAsync` catches exceptions per address, not per batch. One failed address returns `strategy: "error"` with the exception message — the rest of the batch is unaffected. Because the exception is raised inside the in-flight `Task`, every concurrent waiter on that same address receives it too (via `TaskCompletionSource.SetException`) rather than hanging indefinitely.
+
+---
+
+### Operational visibility
+
+**Logging**
+
+Every stage emits structured logs via `ILogger<T>` with thread IDs so individual addresses can be traced across concurrent batch processing:
+
+| Event | Level | Example |
+|---|---|---|
+| Incoming request | `Info` | `POST /api/v1/geocode — 200 in 4823ms` |
+| Normalisation | `Info` | `[Thread 14] Geocoding 'Apt 4 456 Yonge...' → '456 Yonge...'` |
+| Cache hit | `Debug` | `[Thread 14] Cache hit for '456 Yonge St...'` |
+| In-flight dedup | `Debug` | `[Thread 16] Joining in-flight request for '456 Yonge St...'` |
+| Postal code fallback | `Info` | `[Thread 14] Address not found — falling back to postal code 'M5J1E3'` |
+| Result found | `Info` | `[Thread 14] Found '...' via address → lat=43.64, lon=-79.38` |
+| Nominatim call fired | `Debug` | `Nominatim → search?q=456+Yonge...` |
+| Retry | `Warning` | `Nominatim transient failure — retry 1/3 in 2s. Reason: 503` |
+| Circuit opened | `Error` | `Nominatim circuit breaker OPENED — failing fast for 30s` |
+| Circuit closed | `Info` | `Nominatim circuit breaker CLOSED — reachable again` |
+
+Log levels are tunable per namespace in `appsettings.json` without a rebuild. To see logs when running via Docker: `docker compose logs -f`.
+
+**Configuration**
+
+Every operational tunable is externalised — no rebuild needed to adjust behaviour in production:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `Nominatim:BaseUrl` | `https://nominatim.openstreetmap.org/` | Switch to a self-hosted instance |
+| `Nominatim:UserAgent` | `Positrace-Geocoding-Service/1.0 (...)` | Required by Nominatim's usage policy |
+| `Nominatim:RateLimitPerSecond` | `1` | Increase when using self-hosted Nominatim |
+| `Nominatim:TimeoutSeconds` | `5` | Per-attempt timeout |
+| `Nominatim:RetryCount` | `3` | Max retries on transient failure |
+| `Nominatim:RetryDelaySeconds` | `2` | Delay between retries |
+| `Nominatim:CircuitBreakerFailures` | `5` | Failures before circuit opens |
+| `Nominatim:CircuitBreakerBreakSeconds` | `30` | How long circuit stays open |
+| `ConnectionStrings:DefaultConnection` | `Data Source=geocoding.db` | SQLite path |
+
+All keys can be overridden via environment variables (e.g. `Nominatim__TimeoutSeconds=10`) — see `docker-compose.yml` for the Docker pattern.
 
 ---
 

@@ -52,12 +52,15 @@ builder.Services.AddHttpClient("nominatim", client =>
     client.DefaultRequestHeaders.Add("User-Agent", userAgent);
     client.Timeout = TimeSpan.FromSeconds(timeoutSeconds * (retryCount + 1)); // outer timeout covers all retries
 })
-.AddResilienceHandler("nominatim-resilience", pipeline =>
+.AddResilienceHandler("nominatim-resilience", (pipeline, ctx) =>
 {
     // Pipeline order (outermost → innermost):
     //   Retry → CircuitBreaker → Timeout
     // Retry wraps everything; circuit breaker tracks failures across attempts;
     // timeout applies per individual attempt.
+    var logger = ctx.ServiceProvider
+        .GetRequiredService<ILoggerFactory>()
+        .CreateLogger("NominatimResilience");
 
     pipeline.AddRetry(new HttpRetryStrategyOptions
     {
@@ -69,18 +72,44 @@ builder.Services.AddHttpClient("nominatim", client =>
             { Exception: HttpRequestException or TaskCanceledException } => PredicateResult.True(),
             { Result.IsSuccessStatusCode: false }                        => PredicateResult.True(),
             _                                                            => PredicateResult.False()
+        },
+        OnRetry = args =>
+        {
+            logger.LogWarning("Nominatim transient failure — retry {Attempt}/{Max} in {Delay}s. Reason: {Reason}",
+                args.AttemptNumber + 1, retryCount,
+                args.RetryDelay.TotalSeconds,
+                args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString());
+            return ValueTask.CompletedTask;
         }
     });
 
-    // Circuit breaker: if ≥cbFailures of the last calls in a 30s window fail,
-    // stop calling Nominatim for cbBreakSeconds, then allow one probe call.
-    // HttpCircuitBreakerStrategyOptions already handles 5xx/timeouts/HttpRequestException.
+    // Circuit breaker: opens when ≥cbFailures calls all fail within a 30s window.
+    // Stays open for cbBreakSeconds (fast-fail, no Nominatim calls), then half-opens
+    // to send one probe. Logs every state transition for operational visibility.
     pipeline.AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions
     {
-        FailureRatio       = 1.0,                                    // open when 100% of sampled calls fail
-        MinimumThroughput  = cbFailures,                             // need at least this many calls to trigger
-        SamplingDuration   = TimeSpan.FromSeconds(30),               // measure failures over 30s window
-        BreakDuration      = TimeSpan.FromSeconds(cbBreakSeconds),   // stay open this long, then half-open probe
+        FailureRatio      = 1.0,
+        MinimumThroughput = cbFailures,
+        SamplingDuration  = TimeSpan.FromSeconds(30),
+        BreakDuration     = TimeSpan.FromSeconds(cbBreakSeconds),
+        OnOpened = args =>
+        {
+            logger.LogError("Nominatim circuit breaker OPENED — {Failures} consecutive failures. " +
+                            "All geocode calls will fail fast for {Break}s. Reason: {Reason}",
+                cbFailures, cbBreakSeconds,
+                args.Outcome.Exception?.Message ?? args.Outcome.Result?.StatusCode.ToString());
+            return ValueTask.CompletedTask;
+        },
+        OnHalfOpened = args =>
+        {
+            logger.LogWarning("Nominatim circuit breaker HALF-OPEN — sending probe request to test connectivity");
+            return ValueTask.CompletedTask;
+        },
+        OnClosed = args =>
+        {
+            logger.LogInformation("Nominatim circuit breaker CLOSED — Nominatim is reachable again");
+            return ValueTask.CompletedTask;
+        }
     });
 
     pipeline.AddTimeout(TimeSpan.FromSeconds(timeoutSeconds));
