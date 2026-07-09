@@ -9,7 +9,7 @@ services:
     environment:
       - ASPNETCORE_ENVIRONMENT=Production
       - Nominatim__UserAgent=Positrace-Geocoding-Service/1.0 (asifahmed3959@gmail.com)
-      - Nominatim__BaseUrl
+      - Nominatim__BaseUrl=${Nominatim__BaseUrl:-https://nominatim.openstreetmap.org/}
 
   prometheus:
     image: prom/prometheus:v2.53.0
