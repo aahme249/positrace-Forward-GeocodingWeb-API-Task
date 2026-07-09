@@ -17,8 +17,11 @@ public sealed class GeocodingService : IGeocodingService
     private readonly IDbContextFactory<GeocodingDbContext> _dbFactory;
     private readonly ILogger<GeocodingService> _logger;
 
-    // In-flight deduplication: key = normalized address, value = shared Task for the in-progress fetch
-    private readonly ConcurrentDictionary<string, Task<CachedGeocode?>> _inFlight = new(StringComparer.OrdinalIgnoreCase);
+    // In-flight deduplication: key = normalized address, value = Lazy wrapping the shared in-progress Task.
+    // GetOrAdd + Lazy<Task<T>> replaces the manual while(true)+TryAdd+TaskCompletionSource pattern:
+    // GetOrAdd may construct competing Lazy instances under contention, but only one is stored and
+    // ExecutionAndPublication guarantees exactly one factory invocation across all concurrent callers.
+    private readonly ConcurrentDictionary<string, Lazy<Task<CachedGeocode?>>> _inFlight = new(StringComparer.OrdinalIgnoreCase);
 
     public GeocodingService(
         IAddressNormalizer normalizer,
@@ -77,38 +80,28 @@ public sealed class GeocodingService : IGeocodingService
             return hit;
         }
 
-        // In-flight deduplication: only one outbound call per unique address at any time.
-        // The loop + TryAdd guarantees a single winner; all others await the winner's Task.
-        while (true)
+        _logger.LogDebug("[Thread {ThreadId}] Cache miss — joining or starting fetch for '{Address}'",
+            Environment.CurrentManagedThreadId, normalizedAddress);
+
+        // GetOrAdd is not atomic, but the Lazy wrapper is: ExecutionAndPublication ensures the
+        // factory runs exactly once even if two threads both construct a Lazy and race into GetOrAdd.
+        // .WaitAsync(ct) lets each caller cancel their own wait without cancelling the shared fetch.
+        var lazy = _inFlight.GetOrAdd(normalizedAddress,
+            _ => new Lazy<Task<CachedGeocode?>>(() => FetchEvictAndCache(normalizedAddress),
+                 LazyThreadSafetyMode.ExecutionAndPublication));
+
+        return await lazy.Value.WaitAsync(ct);
+    }
+
+    private async Task<CachedGeocode?> FetchEvictAndCache(string normalizedAddress)
+    {
+        try
         {
-            if (_inFlight.TryGetValue(normalizedAddress, out var existing))
-            {
-                _logger.LogDebug("[Thread {ThreadId}] Joining in-flight request for '{Address}'",
-                    Environment.CurrentManagedThreadId, normalizedAddress);
-                return await existing.WaitAsync(ct);
-            }
-
-            var tcs = new TaskCompletionSource<CachedGeocode?>(TaskCreationOptions.RunContinuationsAsynchronously);
-            if (!_inFlight.TryAdd(normalizedAddress, tcs.Task))
-                continue; // Another thread won the race; loop and await their task
-
-            try
-            {
-                // Use CancellationToken.None so one caller's cancellation doesn't abort work
-                // that concurrent callers are also waiting on.
-                var result = await FetchAndCacheAsync(normalizedAddress, CancellationToken.None);
-                tcs.SetResult(result);
-                return result;
-            }
-            catch (Exception ex)
-            {
-                tcs.SetException(ex);
-                throw;
-            }
-            finally
-            {
-                _inFlight.TryRemove(normalizedAddress, out _);
-            }
+            return await FetchAndCacheAsync(normalizedAddress, CancellationToken.None);
+        }
+        finally
+        {
+            _inFlight.TryRemove(normalizedAddress, out _);
         }
     }
 

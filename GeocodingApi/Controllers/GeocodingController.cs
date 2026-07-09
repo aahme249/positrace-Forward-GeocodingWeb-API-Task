@@ -31,7 +31,7 @@ public class GeocodingController(IGeocodingService geocodingService) : Controlle
     /// Each Nominatim call times out after `Nominatim:TimeoutSeconds` (default 5 s) and is retried up to `Nominatim:RetryCount` times (default 3) with `Nominatim:RetryDelaySeconds` (default 2 s) between attempts. All values are configurable in `appsettings.json`.
     ///
     /// **Recommended batch size:** under 50 addresses for sub-minute response times.
-    /// </remarks>
+    /// </remarks>okay 
     [HttpPost]
     [ProducesResponseType(typeof(GeocodeResponse), StatusCodes.Status200OK)]
     [ProducesResponseType(StatusCodes.Status400BadRequest)]

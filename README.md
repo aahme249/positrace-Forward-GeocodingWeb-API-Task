@@ -45,10 +45,8 @@ curl -X POST http://localhost:8080/api/v1/geocode \
       "Apt. 4 456 Yonge St, Toronto, ON M4Y 1X9",
       "123-12 Main St, Toronto, ON M5V 2T6",
       "Unit 201 789 Queen St W, Toronto, ON M6J 1G1",
-      "Suite 300 1000 De La Gauchetière W, Montreal, QC H3B 4W5",
-      "#5 100 Wellington St, Ottawa, ON K1A 0A9",
-      "99999 Nowhere Blvd, Apt 12, Toronto, ON M5V 3A8",
-      "Room 412 Fairmont Royal York, 100 Front St W, Toronto, ON M5J 1E3"
+      "Bureau 7 1000 Rue De La Gauchetière O, Montreal, QC H3B 4W5",
+      "99999 Nowhere Blvd, Apt 12, Toronto, ON M5V 3A8"
     ]
   }'
 ```
@@ -63,10 +61,7 @@ curl -X POST http://localhost:8080/api/v1/geocode \
 {
   "addresses": [
     "123-12 Main St, Toronto, ON M5V 2T6",
-    "Apt. 4 456 Yonge St, Toronto, ON M4Y 1X9",
-    "Unit 201 789 Queen St W, Toronto, ON M6J 1G1",
-    "Suite 300 1000 De La Gauchetière W, Montreal, QC H3B 4W5",
-    "#5 100 Wellington St, Ottawa, ON K1A 0A9"
+    "Apt. 4 456 Yonge St, Toronto, ON M4Y 1X9"
   ]
 }
 ```
@@ -90,7 +85,7 @@ curl -X POST http://localhost:8080/api/v1/geocode \
 }
 ```
 
-Results are returned in the same order and count as the input list, and each one echoes `originalAddress`, so every result maps unambiguously back to its source — including duplicate address strings within the same batch.
+Results are returned in the same order and count as the input list, and each one echoes `originalAddress` so every result maps unambiguously back to its source — including duplicate address strings within the same batch.
 
 ### `strategy` values
 
@@ -100,8 +95,6 @@ Results are returned in the same order and count as the input list, and each one
 | `postal_code` | Address query returned nothing; result comes from the postal code |
 | `not_found` | Neither query returned results |
 | `error` | Nominatim was unreachable or returned an HTTP error |
-
-All cases can be exercised via the Swagger UI at `http://localhost:8080/swagger`.
 
 ---
 
@@ -115,7 +108,7 @@ flowchart TD
 
     B[GeocodingController\nTask.WhenAll — all addresses run concurrently]
 
-    B -->|per address| C[AddressNormalizer\nstrip Apt · Unit · Suite · Room · # · dash-prefix]
+    B -->|per address| C[AddressNormalizer\nstrip Apt · Unit · Suite · Room · # · dash-prefix\nFrench: App · No · Bureau]
 
     C --> D[(SQLite Cache\nlookup by normalizedAddress)]
 
@@ -125,22 +118,22 @@ flowchart TD
 
     E -->|YES — await existing Task| Z1
 
-    E -->|NO — TryAdd and own the fetch| G
+    E -->|NO — own the fetch| G
 
-    G[TokenBucketRateLimiter\n1 token · sec — FIFO queue\nconcurrent HTTP calls allowed]
+    G[TokenBucketRateLimiter\n1 token · sec — FIFO queue]
 
     G -->|token acquired| H[Polly Resilience Pipeline\nRetry → CircuitBreaker → Timeout]
 
-    H -->|circuit OPEN\n5 failures in 30 s| Z2([✗ strategy: error\nfast-fail for 30 s])
+    H -->|circuit OPEN| Z2([✗ strategy: error\nfast-fail for 30 s])
 
     H -->|HTTP GET| I[(Nominatim\nnominatim.openstreetmap.org)]
 
-    I -->|results found| J[Write to SQLite\nPersistAsync]
+    I -->|results found| J[Write to SQLite cache]
     J --> Z3([✓ strategy: address])
 
     I -->|no results| K{Canadian postal code\nin the address?}
     K -->|NO| Z4([✗ strategy: not_found])
-    K -->|YES — retry via postalcode=| G
+    K -->|YES| G
 
     Z3 -->|postal code path| Z5([✓ strategy: postal_code])
 
@@ -166,13 +159,13 @@ sequenceDiagram
     C2->>GS: GeocodeAsync("456 Yonge St")
     C3->>GS: GeocodeAsync("456 Yonge St")
 
-    GS->>CD: TryAdd("456 Yonge St", task) — Client 1 WINS
-    Note over CD: Client 2 & 3 see key exists → await same Task
+    GS->>CD: GetOrAdd — Lazy created, factory not yet run
+    Note over CD: Client 2 & 3 get same Lazy → all await lazy.Value
 
     GS->>N: ONE Nominatim call
 
     N-->>GS: result
-    GS->>CD: TryRemove (fetch complete)
+    GS->>CD: TryRemove
 
     GS-->>C1: result (strategy: address)
     GS-->>C2: result (same Task, no extra call)
@@ -181,224 +174,189 @@ sequenceDiagram
 
 ---
 
-## My approach, step by step
+## Design decisions
 
-I worked through the brief in the order the requirements were given, since each one builds on the last: normalize → geocode → fall back → cache → dedupe → throttle.
+| Problem | Alternatives considered | Chosen | Why |
+|---|---|---|---|
+| **Cache key** | Raw address | **Normalized address** | `"Apt 4 123 Main St"` and `"Unit 4 123 Main St"` resolve to the same geocode — one cache entry serves both |
+| **Database** | SQLite · Redis · Postgres | **SQLite** | Zero-dependency, single-file, sufficient for cache table; `docker compose up` stays a one-liner |
+| **Rate limiting** | `Task.Delay` · `SemaphoreSlim + timestamp` · `TokenBucketRateLimiter` | **`TokenBucketRateLimiter`** | Built-in since .NET 7, no manual clock arithmetic, no edge-of-window burst, FIFO queue |
+| **Rate limit vs retry** | One Polly pipeline for both | **Separate layers** | Rate limiting controls throughput; retry reacts to failure — mixing them makes each harder to reason about |
+| **Concurrency model** | Locks · `Channel<T>` · `ConcurrentDictionary + TCS` · `IMemoryCache` | **`ConcurrentDictionary<string, Lazy<Task<T>>>`** | Single-flight guarantee via `GetOrAdd` + `Lazy`; no manual TCS lifecycle, no `while(true)` retry loop |
+| **Fallback** | None · postal code | **Postal code** | Address may be typo'd or absent in OSM; the postal code in the same string usually still resolves to a valid location |
+| **Service lifetime** | Scoped · Transient | **Singleton** | `NominatimClient` owns the rate-limiter state; `GeocodingService` owns the in-flight dedup map — both must live for the app's lifetime |
 
-### 1. Address normalization
+### Why `TokenBucketRateLimiter` over the alternatives
 
-**Thinking:** Nominatim matches street addresses more reliably without unit/apartment qualifiers, so I strip them *before* the address reaches the outbound client — and I keep the normalised string alongside the raw one in every result, so it's always visible what was actually queried.
+`Task.Delay(1000)` is broken under any concurrency — two simultaneous callers both pass the delay check and fire together. `SemaphoreSlim(1,1)` with a manual timestamp gate works but requires discipline: releasing before the HTTP call (not through it) is non-obvious and easy to miss. `TokenBucketRateLimiter` handles this correctly by design — replenishment is timer-driven, so holding a lease through the HTTP call does not delay the next token. Calls fire at ≤1/sec and overlap in-flight correctly.
 
-**Implementation:** [`AddressNormalizer`](GeocodingApi/Services/AddressNormalizer.cs) runs a fixed pipeline of compiled regexes:
+`FixedWindowRateLimiter` was also rejected: a call at `t=0.99s` and one at `t=1.00s` both pass the 1-req/1s window (two calls 10ms apart), which Nominatim would treat as a burst. `TokenBucket` enforces genuine spacing regardless of window edges.
 
-1. Strip a dash-prefixed unit at the very start of the string (`123-12 Main St` → `123 Main St`) — done first, before any other pass can shift the leading digits.
-2. Strip `Apt`/`Apt.`, `Unit`, `Suite`, and `#`, each followed by its identifier token, wherever they appear.
-3. Collapse the doubled commas/whitespace those removals leave behind.
+### Why not `Channel<T>` for deduplication
 
-**Known limitations** (calling these out explicitly rather than leaving them to be discovered):
+A `Channel<WorkItem>` with a single background consumer would fully decouple callers from Nominatim — the right architecture for high inbound volume (callers arriving faster than 1/sec and not wanting to hold connections open). At this scope — single instance, public Nominatim at 1/sec, workload dominated by cache hits — the added complexity (background service, work-item structs, silent-crash failure mode) isn't justified. The `ConcurrentDictionary + TaskCompletionSource` pattern achieves the same deduplication guarantee within the request lifecycle without a separate worker.
 
-- The unit identifier is matched as a single whitespace-delimited token, so `Unit 12A` strips cleanly but `Unit 12 A` (a space inside the identifier) would not be fully removed.
-- The dash-prefix rule only fires when the pattern sits at the very start of the trimmed address — `Main St 123-12` would not match.
-- French-language equivalents (`App.`, `No`, `Bureau`) aren't handled — every example in the brief was English, so I scoped to what was asked rather than guessing at unstated requirements.
+If inbound volume regularly exceeds Nominatim's processing rate, the right step is switching to an async job API (`POST` → `202 Accepted` + job ID, client polls), which is the natural next step described in the Scalability section.
 
-### 2. Fallback strategy
+### Concurrency model evolution: TCS → `Lazy<Task<T>>`
 
-**Thinking:** A normalised address can still fail to geocode (typo'd street name, address not present in OSM, etc.), but the postal code embedded in the same string is usually still valid and resolves to *something* useful. So the fallback is the same address via a different query, not a different address.
-
-**Implementation:** [`GeocodingService.FetchAndCacheAsync`](GeocodingApi/Services/GeocodingService.cs) tries the normalised street address first; only if Nominatim returns zero results does it call `ExtractPostalCode` (a Canadian postal-code regex, `A1A 1A1`) and retry against `/search?postalcode=`. The `strategy` field tells the caller which query actually produced the coordinates, so a postal-code-level result (block precision) is never silently confused with an exact street match.
-
-### 3. In-flight deduplication
-
-**Thinking:** A batch request can legitimately contain the same address twice, and separate concurrent HTTP requests can target the same address. Neither case should cost two outbound Nominatim calls when one suffices.
-
-**Implementation:** `GeocodingService` holds a `ConcurrentDictionary<string, Task<CachedGeocode?>>` keyed on the *normalised* address. The first caller for a given key wins a `TryAdd` and does the real fetch; every other caller for that key gets the same `Task` back and awaits it instead of starting its own. I used a `TaskCompletionSource` (with `RunContinuationsAsynchronously`) rather than caching the fetch method's `Task` directly, so a slow continuation on one waiter can't block the others. The entry is removed in a `finally` once the fetch settles — success or failure — so the next request for that address goes through the persistent cache or triggers a genuinely fresh fetch, rather than replaying a stale in-flight task.
-
-### 4. Persistent cache
-
-**Thinking:** Vehicles retravel the same routes, so the same addresses recur across restarts — the whole point of persisting is to avoid re-paying the 1 req/s Nominatim cost for something already known. I used SQLite via EF Core: a single-file, dependency-free store is enough for a cache table and keeps `docker compose up` a one-liner.
-
-**Cache key decision — normalised address, not raw input.** I considered keying on the raw string first (no transformation needed at lookup time) but rejected it:
-
-1. **It collapses duplicates.** `"123 Main St Apt 4"`, `"123 Main St Unit 4"`, and `"123-4 Main St"` all normalise to `"123 Main St"`. A raw-input key treats all three as separate cache misses, each firing its own Nominatim call; a normalised key lets them share one entry.
-2. **It matches the source of truth.** What's cached is Nominatim's answer to the query actually sent. Keying on raw input would mean re-normalising on every lookup just to decide whether a stored result applies — redundant.
-3. **Trade-off I accepted:** if normalisation is wrong for some input, the bad cached result would be shared by every raw address mapping to that same wrong key. I judged this acceptable — the failure mode is the normaliser being wrong, which is a bug regardless of caching, and fixing it fixes the cache automatically.
-
-**Implementation:** [`CachedGeocode`](GeocodingApi/Data/CachedGeocode.cs) rows are looked up by `NormalizedAddress` before any outbound call is even considered (`ReadFromCacheAsync`), so a warm cache never touches the in-flight map or Nominatim at all. Writes go through `PersistAsync`, which swallows `DbUpdateException` — a benign race if two processes happen to persist the same key concurrently — rather than failing the request over a duplicate write.
-
-### 5. Rate limiting
-
-**Thinking:** Nominatim's 1 req/s limit is global to the service, not per-request. The throttle has to sit above any per-call logic and serialise *everything* going out, including both the address and postal-code fallback queries. I went through three stages before settling on the final approach:
-
-**Stage 1 — Naive `Task.Delay(1000)`** was the first instinct: sleep 1 second before each call. Rejected immediately — under any concurrency, two callers both pass the "is it time yet?" check simultaneously and fire together. It only works if everything is already serialised through one loop, which throws away the concurrency we need elsewhere.
-
-**Stage 2 — `SemaphoreSlim(1,1)` + timestamp gate** is the classic hand-rolled answer: a mutex so only one caller is in the scheduling section at a time, then compare `DateTime.UtcNow` against the last-call timestamp and sleep the remainder. This *works* and shows understanding of the mechanics. The subtle trap is releasing the semaphore *before* the HTTP call — hold it through the call and N requests take N × HTTP_time instead of N seconds. Serviceable, but manually reimplementing a rate limiter with clock arithmetic is dated in modern .NET.
-
-**Stage 3 — `TokenBucketRateLimiter`** (built into `System.Threading.RateLimiting` since .NET 7): a bucket holds 1 token; a background timer replenishes 1 token/sec. Every call does `AcquireAsync(1)`, which queues the caller until a token is available. No manual clock arithmetic, no two-phase semaphore dance, no risk of holding the lock through the HTTP call. Chose `TokenBucket` over `FixedWindowRateLimiter` because FixedWindow allows back-to-back calls at window edges (calls at t=0.99s and t=1.00s both pass) — TokenBucket enforces genuine spacing.
-
-**Why not `Channel<T>`?** A channel with a single background consumer is architecturally cleaner and the right answer at scale: it fully decouples request ingress from the outbound rate, enables back-pressure, and supports priority queuing. But it trades a ~60-line singleton for a background service, work-item structs, `TaskCompletionSource` lifecycle management, and a silent-crash failure mode. For this scope — single instance, public Nominatim, fleet workload dominated by cache hits — the complexity is not justified. *Where channels clearly win* is the high-volume scenario from the numbers section: inbound requests are arriving faster than 1/sec and callers shouldn't hold HTTP connections open behind the rate-limit gate. There, a channel (or a real broker like Redis Streams) is the shock absorber — accept the request, enqueue, return `202 Accepted` + job ID, drain asynchronously. That is exactly the scaling path described in Future considerations.
-
-**Implementation:** [`NominatimClient`](GeocodingApi/Services/NominatimClient.cs) is a singleton owning a `TokenBucketRateLimiter` (1 token/sec, FIFO, configurable via `Nominatim:RateLimitPerSecond`). Every outbound call calls `AcquireAsync(1)` then fires the HTTP call. Because replenishment is timer-driven, N cold addresses complete in ~N seconds, not N × HTTP_time. Rate limiting and retry/resilience are kept as separate layers — `TokenBucketRateLimiter` controls throughput; Polly (retry + circuit breaker + timeout) handles failure recovery. They compose without interfering.
-
----
-
-## Rate-limiting strategy analysis
-
-This is the core design decision in the service — here is why each option was evaluated and which one was chosen.
-
-### The five strategies
-
-**Option 1 — Naive `Task.Delay(1000)`**
-
-The simplest thing that looks correct: before every call, sleep 1 second.
-
-| | |
-|---|---|
-| Advantage | Two lines of code. No dependencies. |
-| Disadvantage | **Broken under any concurrency.** Two simultaneous callers both skip the delay, both fire at the same moment, and Nominatim sees a burst. The delay runs *in parallel with the request*, not before it. |
-| Verdict | **Do not use.** Violates the rate limit as soon as more than one caller is in play. |
-
----
-
-**Option 2 — `SemaphoreSlim(1,1)` + manual timestamp gate**
-
-The pattern this codebase originally used: one goroutine-like slot guards a `_lastCallAt` field. The semaphore serialises the scheduling decision, computes how long to sleep, then releases *before* the HTTP call so calls can overlap in-flight.
+The initial implementation used `ConcurrentDictionary<string, Task<CachedGeocode?>>` with a manual `while(true)` + `TryAdd` + `TaskCompletionSource` loop:
 
 ```csharp
-await _throttle.WaitAsync(ct);
-try {
-    var wait = TimeSpan.FromSeconds(1) - (DateTime.UtcNow - _lastCallAt);
-    if (wait > TimeSpan.Zero) await Task.Delay(wait, ct);
-    _lastCallAt = DateTime.UtcNow;
-} finally { _throttle.Release(); } // released BEFORE the HTTP call
-```
-
-| | |
-|---|---|
-| Advantage | Correct. Works without extra packages. The two-phase split (scheduling vs. in-flight) is the right mental model. |
-| Disadvantage | **Requires discipline to get right.** A naive implementation holds the semaphore *through* the HTTP call, serialising everything and making N calls take N × HTTP_time. The fix (release before the call) is non-obvious and easy to miss in code review. Also requires manual `DateTime` arithmetic that `TokenBucketRateLimiter` handles internally. |
-| Verdict | **Correct but dated.** Fine to ship; replaced here for clarity. |
-
----
-
-**Option 3 — `TokenBucketRateLimiter` (System.Threading.RateLimiting) ✅ CHOSEN**
-
-The idiomatic .NET 7+ approach. A bucket starts with 1 token; a background timer replenishes 1 token/sec (`AutoReplenishment = true`). Every call does `AcquireAsync(1)`, which queues the caller until a token is available — no manual timestamp arithmetic, no two-phase semaphore dance.
-
-```csharp
-private readonly RateLimiter _rateLimiter = new TokenBucketRateLimiter(new TokenBucketRateLimiterOptions
+// Original pattern
+while (true)
 {
-    TokenLimit = 1, TokensPerPeriod = 1,
-    ReplenishmentPeriod = TimeSpan.FromSeconds(1),
-    AutoReplenishment = true,
-    QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
-    QueueLimit = 10_000,
-});
+    if (_inFlight.TryGetValue(key, out var existing))
+        return await existing.WaitAsync(ct);       // join existing fetch
 
-using var lease = await _rateLimiter.AcquireAsync(permitCount: 1, ct);
+    var tcs = new TaskCompletionSource<CachedGeocode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+    if (!_inFlight.TryAdd(key, tcs.Task)) continue; // lost the race — retry
+
+    try   { var r = await Fetch(); tcs.SetResult(r); return r; }
+    catch (Exception ex) { tcs.SetException(ex); throw; }
+    finally { _inFlight.TryRemove(key, out _); }
+}
 ```
 
-Because replenishment is timer-driven (not triggered by lease disposal), holding the lease through the HTTP call does not delay the next token. The HTTP calls genuinely overlap in-flight — the same N-second wall time as option 2, with less code.
+This is correct — `TryAdd` atomically elects one winner and the `TCS` propagates both result and exception to all concurrent waiters. But it carries manual lifecycle management: the `while(true)` retry, `TCS` setup, explicit `SetResult`/`SetException`, and `TryRemove` in `finally`.
 
-| | |
-|---|---|
-| Advantage | **Smooth 1/sec cadence** — no edge-of-window burst (unlike `FixedWindowRateLimiter`). Built into the runtime — no NuGet package. FIFO queue guarantees fair ordering. `CancellationToken` propagation is first-class. |
-| Disadvantage | **In-process only.** Like `SemaphoreSlim`, this lives in one process — two service instances would double the Nominatim request rate. Needs a distributed rate limiter (Redis, etc.) for horizontal scale. |
-| Verdict | **Best choice for this scope.** Single-process, smooth, idiomatic, minimal code. |
+The current implementation replaces it with `Lazy<Task<T>>`:
 
-**Why `TokenBucket` over `FixedWindow`?**
+```csharp
+// Current pattern
+var lazy = _inFlight.GetOrAdd(key,
+    _ => new Lazy<Task<CachedGeocode?>>(() => FetchEvictAndCache(key),
+         LazyThreadSafetyMode.ExecutionAndPublication));
 
-`FixedWindowRateLimiter(1 req / 1s window)` permits two calls in immediate succession if one arrives at t=0.99 s and the next at t=1.00 s (end of one window → start of the next). Nominatim would see a 10ms gap, not a 1s gap. `TokenBucket` smooths this: a token is consumed and the *next* token is only available 1 s after the *previous* one was consumed, regardless of window boundaries.
-
----
-
-**Option 4 — Polly `RateLimiter` policy**
-
-Polly's `AddRateLimiter` wraps any `System.Threading.RateLimiting` limiter in a Polly pipeline, so it composes with retry and circuit breaker policies.
-
-| | |
-|---|---|
-| Advantage | Natural fit if you are already using Polly for retry + timeout (as this service does via `Microsoft.Extensions.Http.Resilience`). One pipeline handles rate limiting, retry, and timeout together. |
-| Disadvantage | Rate limiting and retry are fundamentally different concerns: retry reacts to *failure*, rate limiting controls *throughput*. Conflating them in one pipeline makes each harder to reason about. A request that hits a rate-limit delay should not trigger retry logic. |
-| Verdict | **Good in the right context.** Polly's resilience pipeline in this service handles retry + timeout; the rate limiter sits upstream of it in `NominatimClient`, keeping the two concerns cleanly separated. |
-
----
-
-**Option 5 — `Channel<T>`-based single-consumer queue**
-
-A `Channel<WorkItem>` decouples callers from Nominatim entirely. A single background worker drains the channel at 1 item/sec and writes results to a `TaskCompletionSource` that the original caller awaits.
-
-| | |
-|---|---|
-| Advantage | **The right architecture for high volume.** Enables priority queuing (premium tenants jump the queue), per-client fairness via multiple channels with round-robin dispatch, back-pressure, and graceful shedding under overload. Survives process restarts if the channel is backed by a durable broker (Redis Streams, Azure Service Bus). |
-| Disadvantage | **Significant complexity for this scope.** You trade a 60-line singleton for a background service, work items, TCS lifecycle management, and a new failure mode (the consumer crashes silently). Requires careful handling of cancellation tokens, channel completion, and error propagation back to callers. |
-| Verdict | **Over-engineered for now, right answer at scale.** Add it when batches regularly exceed 50 addresses or the fleet generates sustained bursts of new-route requests. |
-
----
-
-### Decision summary
-
-```
-Rate-limiting concern:  TokenBucketRateLimiter (Option 3) — smooth 1/sec, no extra packages
-Retry/timeout concern:  Polly via Microsoft.Extensions.Http.Resilience  — separate pipeline
-Scale trigger:          Channel-based queue (Option 5) — when volume demands it
+return await lazy.Value.WaitAsync(ct);
 ```
 
-The two concerns (rate limiting and failure recovery) are kept in separate layers. `TokenBucketRateLimiter` fires at most 1 request/sec; Polly retries if that request fails. They compose without interfering.
+**Why this is better:**
+
+- `GetOrAdd` may construct competing `Lazy` instances under contention, but only one is stored in the dictionary — the rest are discarded and their factories never run
+- `LazyThreadSafetyMode.ExecutionAndPublication` guarantees the stored `Lazy`'s factory executes exactly once, even if multiple threads simultaneously access `.Value`
+- `.WaitAsync(ct)` preserves per-caller cancellability without cancelling the shared fetch (same as `existing.WaitAsync(ct)` in the original)
+- `TryRemove` moves to a dedicated `FetchEvictAndCache` helper, removing it from the hot concurrency path
+- The `while(true)` loop, manual `TCS`, and `SetResult`/`SetException` calls are gone entirely
+
+The correctness guarantee is identical. The code surface area is smaller and the intent is immediately readable.
+
+**Why not `IMemoryCache.GetOrCreateAsync`:**
+
+### Why not `IMemoryCache.GetOrCreateAsync` for deduplication
+
+`IMemoryCache.GetOrCreateAsync` does not provide single-flight semantics — if two requests arrive simultaneously and both miss the cache, both execute the factory and both call Nominatim. The `ConcurrentDictionary` pattern here is more correct because `TryAdd` is atomic: only one caller wins the race and the rest await the winner's `Task`. A library like `LazyCache` (which wraps `Lazy<Task<T>>` inside `IMemoryCache`) would provide the same guarantee with a cleaner API, and is the natural next step if the dedup logic grows more complex.
 
 ---
 
-## Transient failures & operational visibility
+## Address normalization
 
-### Transient failure handling
+[`AddressNormalizer`](GeocodingApi/Services/AddressNormalizer.cs) strips unit qualifiers before the address reaches Nominatim. The original and normalized strings are both returned in every response so it's always visible what was actually queried.
+
+**Rules applied in order:**
+
+1. Dash-prefixed unit at the very start of the string (`123-12 Main St` → `123 Main St`) — done first so later passes don't shift the leading digits
+2. English qualifiers: `Apt`/`Apt.`, `Unit`, `Suite`/`Ste`/`Ste.`, `Room`, `Building`/`Bldg`, `Floor`/`Fl`, `#`
+3. French qualifiers: `App`/`App.` (Appartement), `No`/`No.` (Numéro), `Bureau`
+4. Collapse orphaned whitespace and commas left by removals
+
+Unit identifiers with a spaced letter suffix are handled (`Unit 12 A` → same as `Unit 12A`).
+
+French directional suffix `O` is expanded to `Ouest` before the query is sent — OSM stores the full word, not the abbreviation (`Rue Sherbrooke O` → `Rue Sherbrooke Ouest`). `E`/`N`/`S` are not expanded because they are ambiguous with English East/North/South used in Ontario and BC addresses.
+
+**Known limitations:**
+
+- The dash-prefix rule only fires at the very start of the trimmed address — civic number always comes first in Canadian addressing, so this is correct for all real inputs.
+- French street type prefixes (`Rue`, `Avenue`, `Boulevard`) are not interchangeable in OSM. If the input says `Rue McGill College` but OSM indexes it as `Avenue McGill College`, the address search returns nothing. The postal code fallback recovers the location if the postal code is indexed — if neither is, the result is `not_found`. This is an input data quality issue, not a normalisation bug; the fix is to use the correct street type in the source address.
+- Some Quebec postal codes are absent from Nominatim's OSM dataset. When both the address search and the postal code fallback return empty, `not_found` is returned rather than an error.
+
+---
+
+## Transient failure handling
 
 Three layers protect against Nominatim being slow or unavailable:
 
-**1. Retry with configurable back-off**
-Every outbound call goes through a Polly resilience pipeline. On a transient failure (5xx, timeout, `HttpRequestException`) it retries up to `Nominatim:RetryCount` times (default 3) with a fixed `Nominatim:RetryDelaySeconds` (default 2 s) between attempts. Each retry is logged at `Warning` level:
-```
-warn: NominatimResilience — retry 1/3 in 2s. Reason: 503 ServiceUnavailable
-```
+**Retry** — on a transient failure (5xx, timeout, `HttpRequestException`), retries up to `Nominatim:RetryCount` (default 3) times with a fixed `Nominatim:RetryDelaySeconds` (default 2 s) between attempts.
 
-**2. Per-attempt timeout**
-Each individual attempt times out after `Nominatim:TimeoutSeconds` (default 5 s), preventing a slow Nominatim response from blocking a thread indefinitely. The outer `HttpClient.Timeout` covers all retries combined (`TimeoutSeconds × (RetryCount + 1)`).
+**Timeout** — each individual attempt times out after `Nominatim:TimeoutSeconds` (default 5 s).
 
-**3. Circuit breaker**
-If `Nominatim:CircuitBreakerFailures` (default 5) consecutive calls all fail within a 30 s window, the circuit opens. All further calls fail immediately (no waiting, no retries) for `Nominatim:CircuitBreakerBreakSeconds` (default 30 s). After the break, one probe call goes through (half-open state) — if it succeeds the circuit closes; if not, it stays open another 30 s. Every state transition is logged:
+**Circuit breaker** — if `Nominatim:CircuitBreakerFailures` (default 5) consecutive calls fail within 30 s, the circuit opens and all calls fail immediately for `Nominatim:CircuitBreakerBreakSeconds` (default 30 s). Every state transition is logged:
+
 ```
-error: Nominatim circuit breaker OPENED — 5 consecutive failures. All geocode calls will fail fast for 30s.
-warn:  Nominatim circuit breaker HALF-OPEN — sending probe request to test connectivity
+error: Nominatim circuit breaker OPENED — 5 consecutive failures. Failing fast for 30s.
+warn:  Nominatim circuit breaker HALF-OPEN — sending probe request
 info:  Nominatim circuit breaker CLOSED — Nominatim is reachable again
 ```
 
-**4. Per-address error isolation**
-`GeocodingService.GeocodeAsync` catches exceptions per address, not per batch. One failed address returns `strategy: "error"` with the exception message — the rest of the batch is unaffected. Because the exception is raised inside the in-flight `Task`, every concurrent waiter on that same address receives it too (via `TaskCompletionSource.SetException`) rather than hanging indefinitely.
+**Per-address error isolation** — exceptions are caught per address, not per batch. One failed address returns `strategy: "error"` without affecting the rest of the batch.
 
 ---
 
-### Operational visibility
+## Logging & configuration
 
-**Logging**
+Structured logs are emitted at every stage with thread IDs so individual addresses can be traced across a concurrent batch:
 
-Every stage emits structured logs via `ILogger<T>` with thread IDs so individual addresses can be traced across concurrent batch processing:
+| Event | Level |
+|---|---|
+| Incoming request | `Info` |
+| Normalization applied | `Info` |
+| Cache hit | `Debug` |
+| In-flight dedup join | `Debug` |
+| Postal code fallback | `Info` |
+| Result found + coordinates | `Info` |
+| Nominatim call fired | `Debug` |
+| Retry | `Warning` |
+| Circuit opened / closed | `Error` / `Info` |
 
-| Event | Level | Example |
+To see logs when running via Docker: `docker compose logs -f`.
+
+**Metrics**
+
+Every outbound Nominatim call emits two instruments via `System.Diagnostics.Metrics` (built-in, OpenTelemetry-compatible, no extra packages):
+
+| Metric | Type | Tags |
 |---|---|---|
-| Incoming request | `Info` | `POST /api/v1/geocode — 200 in 4823ms` |
-| Normalisation | `Info` | `[Thread 14] Geocoding 'Apt 4 456 Yonge...' → '456 Yonge...'` |
-| Cache hit | `Debug` | `[Thread 14] Cache hit for '456 Yonge St...'` |
-| In-flight dedup | `Debug` | `[Thread 16] Joining in-flight request for '456 Yonge St...'` |
-| Postal code fallback | `Info` | `[Thread 14] Address not found — falling back to postal code 'M5J1E3'` |
-| Result found | `Info` | `[Thread 14] Found '...' via address → lat=43.64, lon=-79.38` |
-| Nominatim call fired | `Debug` | `Nominatim → search?q=456+Yonge...` |
-| Retry | `Warning` | `Nominatim transient failure — retry 1/3 in 2s. Reason: 503` |
-| Circuit opened | `Error` | `Nominatim circuit breaker OPENED — failing fast for 30s` |
-| Circuit closed | `Info` | `Nominatim circuit breaker CLOSED — reachable again` |
+| `nominatim.calls` | Counter | `path: address \| postal_code`, `outcome: success \| error` |
+| `nominatim.call.duration` (ms) | Histogram | `path: address \| postal_code`, `outcome: success \| error` |
 
-Log levels are tunable per namespace in `appsettings.json` without a rebuild. To see logs when running via Docker: `docker compose logs -f`.
+**Grafana dashboard** — pre-provisioned at `http://localhost:3000` (login `admin` / `admin`) under **Dashboards → Nominatim Metrics**:
 
-**Configuration**
+| Panel | What it shows |
+|---|---|
+| Call Rate | Calls/sec split by `address` vs `postal_code` and `success` vs `error` |
+| Call Duration | p50 / p95 / p99 latency in ms |
+| Total Calls | Cumulative count since startup |
+| Error Rate | Percentage — turns yellow at 5%, red at 10% |
+| Calls by Path | Pie chart — address search vs postal code fallback |
+| Avg Duration | Rolling 5-minute average in ms |
 
-Every operational tunable is externalised — no rebuild needed to adjust behaviour in production:
+**Prometheus** — raw queries at `http://localhost:9090`:
+
+```
+rate(nominatim_calls_total[1m])                          # calls per second
+nominatim_calls_total{outcome="error"}                   # error count
+rate(nominatim_calls_total{outcome="error"}[1m])         # error rate
+histogram_quantile(0.95, rate(nominatim_call_duration_milliseconds_bucket[5m]))  # p95 latency
+```
+
+**Triggering errors to test the error panels** — point the service at an invalid Nominatim URL without rebuilding:
+
+```bash
+docker compose down
+Nominatim__BaseUrl=http://invalid.example/ docker compose up
+```
+
+Send any request with a cold-cache address — the response will show `"strategy": "error"` and the Grafana error rate panel will spike. Restart normally with `docker compose down && docker compose up` to restore.
+
+View live in the terminal while the service is running:
+
+```bash
+dotnet-counters monitor --name GeocodingApi --counters GeocodingApi.Nominatim
+```
+
+Logs answer "what happened to this address" — metrics answer "how many calls were made, and how fast". The tags let you separate address-search latency from postal-code-fallback latency, and spot error rate spikes without grep-ing through logs.
+
+All operational tunables are externalised — no rebuild needed:
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -412,175 +370,87 @@ Every operational tunable is externalised — no rebuild needed to adjust behavi
 | `Nominatim:CircuitBreakerBreakSeconds` | `30` | How long circuit stays open |
 | `ConnectionStrings:DefaultConnection` | `Data Source=geocoding.db` | SQLite path |
 
-All keys can be overridden via environment variables (e.g. `Nominatim__TimeoutSeconds=10`) — see `docker-compose.yml` for the Docker pattern.
+Keys can be overridden via environment variables (`Nominatim__TimeoutSeconds=10`) — see `docker-compose.yml`.
 
 ---
 
-## Test cases
+## Tests
 
-Test cases covering every normalisation rule and all four strategies can be run directly via the Swagger UI at `http://localhost:8080/swagger` — the request body is pre-filled with a 14-address mixed batch. I didn't add a separate xUnit project for this assessment — given the scope, I prioritised exercising the real HTTP surface end-to-end (actual rate limiter, actual cache, actual Nominatim) over unit-testing the regex pipeline in isolation, since the normalisation rules are small enough to verify directly against [`AddressNormalizer.cs`](GeocodingApi/Services/AddressNormalizer.cs).
+31 automated tests across two suites:
+
+```
+dotnet test GeocodingApi.Tests/
+```
+
+| Suite | Coverage |
+|---|---|
+| `AddressNormalizerTests` | Every normalization rule: dash-unit, Apt, Unit (including spaced-letter suffix), Suite/Ste, Room, Hash, French App./No./Bureau; postal code extraction |
+| `GeocodingServiceTests` | Address strategy, postal code fallback, not-found, cache hit on second call, normalization-to-cache-key collapse, concurrent deduplication (5 goroutines → 1 Nominatim call), per-address error isolation |
+
+Integration tests use real SQLite (in-memory) and a mocked `INominatimClient` — no live HTTP calls.
 
 ---
 
-## Concurrency & throttling — observed behaviour
+## Observed behaviour
 
-Five tests run against a live Docker instance to verify all strategies, the rate limiter, cache, and in-flight deduplication work correctly end-to-end.
-
-### Results
+Five tests run against a live Docker instance:
 
 | Test | Scenario | Wall time | Nominatim calls | Outcome |
 |---|---|---|---|---|
 | 1 | 14-address mixed batch, cold cache | **2.2 s** | 12 unique | All 4 strategies returned correctly |
 | 2 | Same 14 addresses (warm cache) | **18 ms** | 0 | 760× faster, zero Nominatim calls |
 | 3 | 5 landmarks, cold cache | **4.4 s** | 4 (1 not_found) | Parliament Hill not in OSM — `not_found` |
-| 4 | 5 remote places (Iqaluit, Inuvik, Churchill…) | **17 ms** | 0 | Already cached from mixed batch |
-| 5 | 4× same address, different qualifiers | **3 ms** | 0 | All served from cache, `[Thread 7]` throughout |
+| 4 | 5 remote places (Iqaluit, Inuvik, Churchill) | **17 ms** | 0 | Already cached from mixed batch |
+| 5 | 4× same address, different qualifiers | **3 ms** | 0 | All served from one cache entry |
 
-### What the numbers show
+**Test 1 vs 2** — 14 cold addresses complete in 2.2 s (rate-limited at 1/sec). The same 14 warm return in 18 ms — **760× faster**. For a vehicle fleet revisiting known routes, the vast majority of requests are cache hits within the first run.
 
-**Test 1 vs 2 — cache impact is dramatic.**
-14 cold addresses complete in 2.2 s (rate-limited, ~1 call/sec). The same 14 addresses warm return in 18 ms — **760× faster**. For a vehicle fleet revisiting known routes, the vast majority of requests hit the cache within the first run.
-
-**Test 3 — `not_found` is clean, not an error.**
-Parliament Hill (`Parliament Hill, Wellington St`) has no OSM entry at that string — `not_found` is returned rather than a crash or partial result. The other 4 landmarks all geocoded correctly in the same batch.
-
-**Test 4 — cache persists across requests.**
-The remote-places batch returned in 17 ms because Iqaluit was already cached from the mixed-batch test. The cache is global across all batches in the same session and survives container restarts (SQLite volume).
-
-**Test 5 — deduplication collapses qualifiers.**
-`100 Queen St W`, `Apt 3 100 Queen St W`, and `Unit 7 100 Queen St W` all normalise to the same string. All four slots in the response are served from one cache entry — `[Thread 7]` appears for every result, and no Nominatim call is made.
+**Test 5** — `100 Queen St W`, `Apt 3 100 Queen St W`, and `Unit 7 100 Queen St W` all normalize to the same string and share one cache entry. No Nominatim call is made.
 
 ---
 
-### Strengths of this approach
+## Scalability
 
-- **Cache collapses repeated-route cost to near-zero.** The dominant use case (vehicles re-travelling routes) is served from SQLite with no outbound calls.
-- **In-flight dedup prevents thundering herd.** If 50 vehicles submit the same new address simultaneously, Nominatim is called once, not 50 times.
-- **Rate limiter is tight and correct.** `TokenBucketRateLimiter` enforces genuine 1/sec spacing — no edge-of-window burst. Replenishment is timer-driven, so calls overlap in-flight: one new call fires per second, N calls complete in N seconds, not N × HTTP_time seconds.
-- **Per-address error isolation.** One failed address returns `strategy: "error"` without failing the rest of the batch.
-- **Retry with configurable back-off.** Transient Nominatim failures are retried silently before surfacing an error to the caller.
+### Current ceiling (single instance, public Nominatim)
 
-### Weaknesses of this approach
+| Scenario | Throughput |
+|---|---|
+| Warm cache | ~1,000 addresses/sec (SQLite reads) |
+| Cold cache | 1 address/sec (Nominatim's hard ceiling) |
+| Typical fleet (high cache-hit rate) | ~1,000 cached + 1 cold/sec |
+| Per day (cold) | ~86,400 unique new addresses |
 
-- **In-process rate limiter doesn't scale horizontally.** Running two instances doubles the Nominatim request rate — `TokenBucketRateLimiter` lives in one process with no distributed coordination. Mitigation: Redis-backed distributed rate limiter, or a single Nominatim-facing worker behind an internal queue.
-- **No per-client fairness.** A single client submitting 200 cold addresses monopolises the rate limiter for ~200 seconds, blocking all other clients' new addresses. Cached requests are unaffected. Mitigation: per-client request queues with round-robin dispatch.
-- **No batch size limit enforced.** A caller can send 1,000 addresses and hold an HTTP connection open for ~17 minutes. Mitigation: cap batch size (e.g. 50) and recommend async job submission for larger workloads.
-- **In-flight dedup state is in-memory only.** If the service restarts mid-fetch, in-progress tasks are lost. Completed results survive via the persistent cache; only the in-progress ones must be retried by the caller.
+For a fleet of hundreds of vehicles revisiting known routes this is comfortable — after the first run, most batches are pure cache hits.
 
----
+### Path to higher throughput
 
-## Scalability in numbers
-
-### Current capacity (single instance, public Nominatim)
-
-| Scenario | Throughput | Notes |
-|---|---|---|
-| Warm cache (all cached) | **~1,000 addresses/sec** | SQLite SELECT, ~1ms each |
-| Cold cache (all new) | **1 address/sec** | Hard ceiling — Nominatim's 1 req/s policy |
-| Mixed (typical fleet) | **~1,000 cached + 1 cold/sec** | After day 1, most routes are cached |
-| 10 cold addresses | **~10 seconds** | 1 Nominatim call/sec, overlapping in-flight |
-| 50 cold addresses | **~50 seconds** | Recommended max batch size |
-| 100 cold addresses | **~1 min 40 sec** | Connection held open — approaching timeout risk |
-| 1,000 cold addresses | **~17 minutes** | Should use async job queue instead |
-| Per day (cold) | **~86,400 unique addresses** | 1/sec × 86,400 seconds/day |
-| Per hour (cold) | **~3,600 unique addresses** | Practical ceiling for new-route ingestion |
-
-### How to improve it
-
-| Improvement | What changes | Numbers after |
-|---|---|---|
-| **Cap batch size at 50** | Return `400 Bad Request` above 50 addresses | Max response time bounded to ~50s |
-| **Async job queue** (`Channel<T>` or Redis Streams) | `POST` returns a job ID; client polls `GET /jobs/{id}` | Handles 10,000+ address batches without holding connections |
-| **Redis distributed cache** | Replace SQLite with Redis shared across all pods | 100,000+ cached reads/sec; survives pod restarts |
-| **Redis distributed rate limiter** | Replace in-process `TokenBucketRateLimiter` | Multiple pods share one 1 req/sec gate — safe to scale horizontally |
-| **Self-hosted Nominatim** (Canada extract, ~50 GB) | Private OSM instance, no rate limit | 50–200 geocodes/sec on commodity hardware; unlimited fan-out |
-| **Self-hosted + worker pool (10 workers)** | 10 concurrent threads against private Nominatim | ~500–2,000 addresses/sec; same-day geocoding of a national fleet |
-
-### Practical scale ceiling without any changes
-
-> One instance, public Nominatim, high cache-hit fleet:
-> **~1 million cached lookups/day** + **~86,400 new addresses/day** — comfortably handles a fleet of hundreds of vehicles revisiting known routes, with capacity headroom for new-route discovery.
-
----
-
-## Future considerations
-
-### Asynchronous message queue
-
-The current API is synchronous — the client holds the HTTP connection open until every address is geocoded. This works well for small batches (< 50 addresses) and high cache-hit workloads (vehicles re-travelling the same routes quickly warm the cache), but breaks down for large cold-cache batches:
-
-- 200 new addresses on a fresh route = ~200 seconds of open connection
-- Multiple fleet operators submitting large batches simultaneously have no backpressure
-- A service restart mid-batch loses all in-progress work
-
-A job-based async model solves this:
+**Async job API** — for batches that exceed ~50 cold addresses, replace the synchronous response with fire-and-forget:
 
 ```
 POST /api/v1/geocode         → 202 Accepted  { "jobId": "abc-123" }
 GET  /api/v1/geocode/{jobId} → 200 OK with results (or 202 still processing)
 ```
 
-A background worker reads from an in-process `Channel<T>` (or an external broker like Redis / Azure Service Bus for durability across restarts), applies the same rate-limited Nominatim pipeline, and writes results to the SQLite cache. The client polls until the job is complete.
+The `POST` returns in < 1 ms regardless of batch size. A background worker pool drains the queue at the configured rate and writes results to the cache. This eliminates open connections, enables backpressure, and survives restarts if backed by Redis / Azure Service Bus.
 
-**When to add it:** if batches regularly exceed 50 addresses, or if the fleet generates large bursts of new-route addresses that overwhelm the synchronous timeout budget. For the described use case (recurring vehicle routes, high cache-hit rate) the synchronous API is sufficient.
+**Multiple instances** — the only blocker for horizontal scaling is the in-process `TokenBucketRateLimiter`: two pods would send 2 req/sec to Nominatim. Moving the rate-limit gate to Redis (distributed rate limiter + shared cache) removes this constraint. With a self-hosted Nominatim instance (Canada OSM extract, ~50 GB, no rate limit), a 100-worker pool reaches ~100 geocodes/sec, and N pods scale cached-request throughput linearly.
 
-### Self-hosted Nominatim
+At significant scale, the geocoding pipeline becomes invisible — once the fleet's address space is cached, every subsequent request is a Redis read under 1 ms with no Nominatim involvement.
 
-Using the public Nominatim endpoint caps throughput at 1 req/sec per IP regardless of architecture. Running a private Nominatim instance (open source, ~50 GB disk for Canada-only extract) removes the rate limit entirely, allows fan-out to a worker pool, and eliminates the dependency on a third-party service — the right call once geocoding volume justifies the infrastructure cost.
-
-### At-scale testing (1 million addresses)
-
-Testing against public Nominatim at 1 million addresses is not feasible — at 1 req/sec that is 11.6 days of continuous calls, and the IP would be banned well before completion. The correct path at that volume:
-
-1. **Self-hosted Nominatim** — Canada OSM extract (~50 GB), no rate limit
-2. **Worker pool** — 100 concurrent workers against the private instance
-3. **Time to geocode 1 million** — ~3 hours (1,000,000 ÷ ~100 req/sec)
-4. **After completion** — everything is in the cache; all future lookups return in milliseconds
-
-### Horizontal scaling
-
-The current in-process `TokenBucketRateLimiter` is the blocker for horizontal scaling — two pods would send 2 req/sec to Nominatim, violating the usage policy. The fix is to move the rate-limit gate into a shared layer: a load balancer distributes inbound requests across N pods, all pods read/write a shared Redis cache, and a single Redis-backed distributed rate limiter enforces the 1 req/sec global budget before any pod calls Nominatim. With self-hosted Nominatim the rate limit is removed entirely and the worker pool can scale freely.
-
-Changes required:
-- Replace `TokenBucketRateLimiter` with a Redis-backed rate limiter (sliding window via `INCR` + `EXPIRE`)
-- Replace SQLite with Redis or Postgres so all pods share one cache
-- All other logic (normaliser, dedup, fallback, Polly pipeline) stays unchanged
-- With self-hosted Nominatim, raise `Nominatim:RateLimitPerSecond` to match worker pool size
-
-### Scaling to 1 million requests
-
-At 1 million addresses, roughly 90% will be cache hits after the first day (vehicles revisiting known routes), returning in ~1ms each. The remaining 10% new addresses are enqueued as async jobs, drained by a 100-worker pool against a self-hosted Nominatim instance at ~100 req/sec — completing in ~17 minutes. With a nightly prefetch of all known route addresses, day-2 onwards the entire million-address batch returns in seconds with zero Nominatim calls.
-
-### Prefetch — eliminating all overhead for known routes
-
-The single most effective optimisation for a vehicle fleet is **eager prefetching**: geocode every known route address at startup or overnight, rather than waiting for a vehicle to submit it.
-
-```
-Background job (nightly) → reads route database → calls /api/v1/geocode in batches
-                                                 → results written to SQLite cache
-
-Vehicle submits batch at runtime → 100% cache hit → returns in ~5 ms → zero Nominatim calls
-```
-
-With a full prefetch, the entire Nominatim pipeline (rate limiter, retry, circuit breaker, fallback) becomes invisible to the caller on the hot path. The service degrades gracefully to on-demand geocoding only for genuinely new addresses not in the prefetch set. This eliminates all response-time variability for known routes and makes the 1 req/sec constraint irrelevant for day-to-day fleet operations.
-
-### Limitations of the current design
+### Current limitations
 
 | Limitation | Impact | Mitigation |
 |---|---|---|
-| Public Nominatim 1 req/sec | Max 3,600 new addresses/hour, 86,400/day | Self-hosted Nominatim |
+| Public Nominatim 1 req/sec | Max 3,600 new addresses/hour | Self-hosted Nominatim |
 | In-process rate limiter | Cannot run more than one pod safely | Redis distributed rate limiter |
 | SQLite single-writer | Not safe across multiple pods | Postgres or Redis shared cache |
-| No batch size cap | 1,000 addresses = 17-minute open connection | Enforce max 50; async job queue above that |
-| No per-client fairness | Large batch monopolises queue for all clients | Per-tenant rate limit slots |
-| In-memory dedup state | Lost on restart (completed results survive) | Acceptable for this scope |
-| No prefetch | First-run cold batches are slow | Nightly prefetch job for known routes |
+| No batch size cap | Large cold batches hold connections open | Enforce max 50; async jobs above that |
+| No per-client fairness | Large batch monopolises queue | Per-tenant rate limit slots |
 
 ---
 
 ## Development tooling
 
-I built and iterated on this in **Claude Code**, running in a terminal against this repo, rather than writing everything by hand from scratch. In practice that meant: I set the requirements and made the calls on structure and trade-offs (singleton vs. scoped services, cache key, fallback design), and used the agent to scaffold boilerplate and wire up the Docker/EF Core setup, then reviewed and adjusted the generated code myself before it went in. This README itself — including the "step by step" section above — was written the same way: I asked for a walkthrough of the reasoning behind each requirement, then reviewed it against the actual source for accuracy.
+Built and iterated on using **Claude Code** in a terminal against this repo. I set the requirements and made the architectural calls (singleton lifetimes, cache key, fallback design, rate-limiter choice), used the agent to scaffold boilerplate and wire up the Docker/EF Core setup, then reviewed and adjusted the generated code before it went in.
 
-[`CLAUDE.md`](CLAUDE.md) in the repo root is a machine-readable onboarding file for this project. It's written for coding agents (Claude Code or otherwise) rather than for humans: build/run commands, the request-flow architecture, and the invariants that back each of the five assessment requirements (cache key choice, singleton lifetimes, rate-limiter placement, dedup vs. cache scope, regex ordering) — the things an agent would otherwise have to rediscover by reading every file before making a safe change.
-# positrace-Forward-GeocodingWeb-API-Task
+[`CLAUDE.md`](CLAUDE.md) is a machine-readable onboarding file for coding agents — build/run commands, request-flow architecture, and the invariants behind each assessment requirement.

@@ -1,0 +1,8 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: geocoding-api
+    static_configs:
+      - targets: ['geocoding-api:8080']
+    metrics_path: /metrics

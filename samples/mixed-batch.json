@@ -1,0 +1,36 @@
+{
+  "_comments": [
+    "A representative mixed batch covering all normalization rules and fallback paths.",
+    "Submit to POST /api/v1/geocode to see all strategy values in one response.",
+    "Address 01 — plain street address, no unit qualifier",
+    "Address 02 — Apt qualifier stripped before lookup",
+    "Address 03 — Unit qualifier stripped before lookup",
+    "Address 04 — Suite qualifier stripped before lookup",
+    "Address 05 — # (hash) qualifier stripped before lookup",
+    "Address 06 — dash-unit prefix stripped (123-12 → 123)",
+    "Address 07 — Room qualifier stripped (hotel room)",
+    "Address 08 — French App. qualifier stripped",
+    "Address 09 — French Bureau qualifier stripped",
+    "Address 10 — postal-code fallback (bad street, valid postal code)",
+    "Address 11 — not found (no results from either search path)",
+    "Address 12 — duplicate of Address 01 (cache hit on second occurrence)",
+    "Address 13 — remote address (Iqaluit, Nunavut)",
+    "Address 14 — French No. qualifier stripped"
+  ],
+  "addresses": [
+    "100 Queen St W, Toronto, ON M5H 2N2",
+    "Apt 3B 250 King St E, Toronto, ON M5A 1J7",
+    "Unit 12A 8028 120 St, Surrey, BC V3W 3N3",
+    "Suite 200 1090 West Georgia St, Vancouver, BC V6E 3V7",
+    "#5 2568 Granville St, Vancouver, BC V6H 3G8",
+    "123-12 Bathurst St, Toronto, ON M5T 2S5",
+    "Room 412 Fairmont Royal York, 100 Front St W, Toronto, ON M5J 1E3",
+    "App. 4 3500 Rue Sherbrooke O, Montreal, QC H3Z 1E5",
+    "Bureau 7 1000 Rue De La Gauchetière O, Montreal, QC H3B 4W5",
+    "99999 Nowhere Blvd, Toronto, ON M5V 3A8",
+    "Unit 5 99999 Nowhere Blvd, Faketown, ON",
+    "100 Queen St W, Toronto, ON M5H 2N2",
+    "1 Hospital Rd, Iqaluit, NU X0A 0H0",
+    "No. 8 1801 Rue McGill College, Montreal, QC H3A 2N4"
+  ]
+}

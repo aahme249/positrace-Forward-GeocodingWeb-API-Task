@@ -4,9 +4,16 @@ using GeocodingApi.Services;
 using Microsoft.AspNetCore.HttpLogging;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Http.Resilience;
+using OpenTelemetry.Metrics;
 using Polly;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// ── OpenTelemetry metrics → Prometheus ────────────────────────────────────────
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(m => m
+        .AddMeter("GeocodingApi.Nominatim")
+        .AddPrometheusExporter());
 
 // ── Controllers + JSON ────────────────────────────────────────────────────────
 builder.Services.AddControllers();
@@ -142,5 +149,6 @@ app.UseHttpLogging();
 app.UseSwagger();
 app.UseSwaggerUI(c => c.SwaggerEndpoint("/swagger/v1/swagger.json", "Positrace Geocoding API v1"));
 
+app.MapPrometheusScrapingEndpoint(); // GET /metrics — scraped by Prometheus every 5s
 app.MapControllers();
 app.Run();
