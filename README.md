@@ -53,20 +53,6 @@ curl -X POST http://localhost:8080/api/v1/geocode \
   }'
 ```
 
-Or use the ready-made sample files:
-
-```bash
-# Each file targets one normalisation rule
-curl -X POST http://localhost:8080/api/v1/geocode \
-  -H "Content-Type: application/json" \
-  -d @samples/mixed-batch.json
-
-# Other samples: apt.json  unit.json  suite.json  hash.json
-#                dash-unit.json  postal-code-fallback.json  not-found.json
-```
-
-If you use VS Code or a JetBrains IDE, open [`requests.http`](requests.http) and click **Send Request** above any block — no curl needed.
-
 ---
 
 ## POST /api/v1/geocode
@@ -115,7 +101,7 @@ Results are returned in the same order and count as the input list, and each one
 | `not_found` | Neither query returned results |
 | `error` | Nominatim was unreachable or returned an HTTP error |
 
-Ready-to-run requests for every case below are in [`requests.http`](requests.http) and [`samples/`](samples).
+All cases can be exercised via the Swagger UI at `http://localhost:8080/swagger`.
 
 ---
 
@@ -432,20 +418,7 @@ All keys can be overridden via environment variables (e.g. `Nominatim__TimeoutSe
 
 ## Test cases
 
-One fixture per normalisation rule, plus the two non-happy paths, so each can be exercised independently or as a batch:
-
-| File | Exercises |
-|---|---|
-| `samples/dash-unit.json` | Dash-prefixed unit (`123-12 Main St`) |
-| `samples/apt.json` | `Apt` and `Apt.` (with and without period) |
-| `samples/unit.json` | `Unit` qualifier |
-| `samples/suite.json` | `Suite` qualifier |
-| `samples/hash.json` | `#` qualifier |
-| `samples/postal-code-fallback.json` | Nonsense street name, valid postal code → `strategy: "postal_code"` |
-| `samples/not-found.json` | Nonsense street *and* no postal code → `strategy: "not_found"` |
-| `samples/mixed-batch.json` | All of the above in a single request, to confirm ordering/mapping holds under a mixed batch |
-
-[`requests.http`](requests.http) wraps the same cases as runnable requests (VS Code REST Client / JetBrains HTTP Client). I didn't add a separate xUnit project for this assessment — given the scope, I prioritised exercising the real HTTP surface end-to-end (actual rate limiter, actual cache, actual Nominatim) over unit-testing the regex pipeline in isolation, since the normalisation rules are small enough to verify directly against [`AddressNormalizer.cs`](GeocodingApi/Services/AddressNormalizer.cs).
+Test cases covering every normalisation rule and all four strategies can be run directly via the Swagger UI at `http://localhost:8080/swagger` — the request body is pre-filled with a 14-address mixed batch. I didn't add a separate xUnit project for this assessment — given the scope, I prioritised exercising the real HTTP surface end-to-end (actual rate limiter, actual cache, actual Nominatim) over unit-testing the regex pipeline in isolation, since the normalisation rules are small enough to verify directly against [`AddressNormalizer.cs`](GeocodingApi/Services/AddressNormalizer.cs).
 
 ---
 
@@ -607,7 +580,7 @@ With a full prefetch, the entire Nominatim pipeline (rate limiter, retry, circui
 
 ## Development tooling
 
-I built and iterated on this in **Claude Code**, running in a terminal against this repo, rather than writing everything by hand from scratch. In practice that meant: I set the requirements and made the calls on structure and trade-offs (singleton vs. scoped services, cache key, fallback design), and used the agent to scaffold boilerplate, wire up the Docker/EF Core setup, and draft the sample fixtures/`requests.http`, then reviewed and adjusted the generated code myself before it went in. This README itself — including the "step by step" section above — was written the same way: I asked for a walkthrough of the reasoning behind each requirement, then reviewed it against the actual source for accuracy.
+I built and iterated on this in **Claude Code**, running in a terminal against this repo, rather than writing everything by hand from scratch. In practice that meant: I set the requirements and made the calls on structure and trade-offs (singleton vs. scoped services, cache key, fallback design), and used the agent to scaffold boilerplate and wire up the Docker/EF Core setup, then reviewed and adjusted the generated code myself before it went in. This README itself — including the "step by step" section above — was written the same way: I asked for a walkthrough of the reasoning behind each requirement, then reviewed it against the actual source for accuracy.
 
 [`CLAUDE.md`](CLAUDE.md) in the repo root is a machine-readable onboarding file for this project. It's written for coding agents (Claude Code or otherwise) rather than for humans: build/run commands, the request-flow architecture, and the invariants that back each of the five assessment requirements (cache key choice, singleton lifetimes, rate-limiter placement, dedup vs. cache scope, regex ordering) — the things an agent would otherwise have to rediscover by reading every file before making a safe change.
 # positrace-Forward-GeocodingWeb-API-Task
